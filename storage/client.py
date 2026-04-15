@@ -5,6 +5,8 @@ from typing import List, Optional, Dict, Any
 from datetime import date
 
 from shared.schemas.normalized import NormalizedRecord
+from shared.schemas.anomaly import AnomalyResult
+from shared.schemas.forecast import ForecastResult
 from storage.db import DatabaseManager
 from storage.models import UpsertResult
 
@@ -319,20 +321,226 @@ class StorageClient:
 
     def update_anomaly_flags(
         self,
-        fingerprints: List[str],
+        identifiers: List[Any],
         anomaly_flag: bool,
-        anomaly_severity: Optional[str]
+        anomaly_severity: Optional[str],
+        use_dimensions: bool = False
     ) -> int:
         
-        if not fingerprints:
+        if not identifiers:
             return 0
             
-        query = """
-        UPDATE billing_records
-        SET anomaly_flag = %s, anomaly_severity = %s
-        WHERE fingerprint IN %s
+        if use_dimensions:
+            # identifiers is a list of dicts with: cloud_provider, service_category, account_id, usage_date
+            query = """
+            UPDATE billing_records
+            SET anomaly_flag = %s, anomaly_severity = %s
+            WHERE (cloud_provider, service_category, account_id, usage_date) IN %s
+            """
+            dims = [
+                (d["cloud_provider"], d["service"], d["account_id"], d["usage_date"])
+                for d in identifiers
+            ]
+            with DatabaseManager.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (anomaly_flag, anomaly_severity, tuple(dims)))
+                    return cur.rowcount
+        else:
+            # legacy fingerprint/record_id lookup
+            query = """
+            UPDATE billing_records
+            SET anomaly_flag = %s, anomaly_severity = %s
+            WHERE fingerprint IN %s OR record_id IN %s
+            """
+            with DatabaseManager.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, (anomaly_flag, anomaly_severity, tuple(identifiers), tuple(identifiers)))
+                    return cur.rowcount
+
+    def write_anomalies(self, anomalies: List[AnomalyResult], metadata: List[dict]) -> int:
         """
+        Bulk upsert anomaly rows. metadata is a list of dicts with:
+        cloud_provider, service, account_id, usage_date,
+        zscore_score, iforest_score, lstm_score, ensemble_score.
+        Returns count of rows written.
+        """
+        if not anomalies:
+            return 0
+
+        query = """
+        INSERT INTO anomalies (
+            anomaly_id, record_id, detection_method, severity,
+            z_score, expected_cost, actual_cost, deviation_pct,
+            detected_at, shap_attribution,
+            cloud_provider, service, account_id, usage_date,
+            zscore_score, iforest_score, lstm_score, ensemble_score
+        ) VALUES %s
+        ON CONFLICT (anomaly_id) DO UPDATE SET
+            ensemble_score = EXCLUDED.ensemble_score,
+            severity = EXCLUDED.severity;
+        """
+
+        values = []
+        for ar, meta in zip(anomalies, metadata):
+            values.append((
+                ar.anomaly_id, ar.record_id, ar.detection_method,
+                ar.severity.value if hasattr(ar.severity, 'value') else ar.severity,
+                ar.z_score, ar.expected_cost, ar.actual_cost, ar.deviation_pct,
+                ar.detected_at,
+                json.dumps(ar.shap_attribution) if ar.shap_attribution else None,
+                meta["cloud_provider"], meta["service"], meta["account_id"],
+                meta["usage_date"],
+                meta.get("zscore_score"), meta.get("iforest_score"),
+                meta.get("lstm_score"), meta["ensemble_score"]
+            ))
+
+        total = 0
+        batch_size = 1000
         with DatabaseManager.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (anomaly_flag, anomaly_severity, tuple(fingerprints)))
-                return cur.rowcount
+                for i in range(0, len(values), batch_size):
+                    batch = values[i:i + batch_size]
+                    psycopg2.extras.execute_values(cur, query, batch, page_size=1000)
+                    total += cur.rowcount
+        return total
+
+    def get_anomalies(
+        self,
+        cloud_provider: Optional[str] = None,
+        service: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        min_severity: Optional[str] = None,
+        limit: int = 1000
+    ) -> List[dict]:
+        """
+        Query anomalies table with optional filters.
+        Returns list of dicts (raw rows, not AnomalyResult objects).
+        """
+        query = "SELECT * FROM anomalies WHERE 1=1"
+        params = []
+
+        if cloud_provider:
+            query += " AND cloud_provider = %s"
+            params.append(cloud_provider)
+        if service:
+            query += " AND service = %s"
+            params.append(service)
+        if start_date:
+            query += " AND usage_date >= %s"
+            params.append(start_date)
+        if end_date:
+            query += " AND usage_date <= %s"
+            params.append(end_date)
+        
+        if min_severity:
+            # min_severity maps to: low=0.3, medium=0.5, high=0.7, critical=0.9
+            # Since severity is a string ('low', 'medium', 'high', 'critical'), 
+            # we should instead filter using the ensemble_score threshold if severity filtering is needed by value,
+            # but usually it's just a direct severity check, or we can resolve it via score.
+            # Assuming min_severity maps to scores based on config.
+            from detection import config
+            if min_severity in config.SEVERITY_THRESHOLDS:
+                threshold = config.SEVERITY_THRESHOLDS[min_severity]
+                query += " AND ensemble_score >= %s"
+                params.append(threshold)
+
+        query += " ORDER BY usage_date DESC, ensemble_score DESC LIMIT %s"
+        params.append(limit)
+
+        results = []
+        with DatabaseManager.get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, tuple(params))
+                for row in cur.fetchall():
+                    results.append(dict(row))
+        return results
+
+    # ── Forecasting ────────────────────────────────────────────
+
+    def write_forecasts(self, forecasts: List[ForecastResult], metadata: List[dict]) -> int:
+        """
+        Bulk upsert forecast rows.
+        metadata list items: {prophet_prediction, lgbm_prediction, prophet_weight, lgbm_weight}
+        ON CONFLICT on (cloud_provider, service, horizon_days, forecast_date, model_used) DO UPDATE
+        SET predicted_cost=EXCLUDED.predicted_cost,
+            lower_bound=EXCLUDED.lower_bound,
+            upper_bound=EXCLUDED.upper_bound.
+        Returns count of rows written.
+        """
+        if not forecasts:
+            return 0
+
+        query = """
+        INSERT INTO forecasts (
+            forecast_id, cloud_provider, service, region, horizon_days,
+            forecast_date, predicted_cost, lower_bound, upper_bound,
+            model_used, generated_at, prophet_prediction, lgbm_prediction,
+            prophet_weight, lgbm_weight
+        ) VALUES %s
+        ON CONFLICT (cloud_provider, service, horizon_days, forecast_date, model_used) DO UPDATE SET
+            predicted_cost = EXCLUDED.predicted_cost,
+            lower_bound = EXCLUDED.lower_bound,
+            upper_bound = EXCLUDED.upper_bound;
+        """
+
+        values = []
+        for fr, meta in zip(forecasts, metadata):
+            values.append((
+                fr.forecast_id, fr.cloud_provider.value if hasattr(fr.cloud_provider, 'value') else fr.cloud_provider, 
+                fr.service, fr.region, fr.horizon_days,
+                fr.forecast_date, fr.predicted_cost, fr.lower_bound, fr.upper_bound,
+                fr.model_used, fr.generated_at,
+                meta.get("prophet_prediction"), meta.get("lgbm_prediction"),
+                meta.get("prophet_weight"), meta.get("lgbm_weight")
+            ))
+
+        total = 0
+        batch_size = 1000
+        with DatabaseManager.get_connection() as conn:
+            with conn.cursor() as cur:
+                for i in range(0, len(values), batch_size):
+                    batch = values[i:i + batch_size]
+                    psycopg2.extras.execute_values(cur, query, batch, page_size=1000)
+                    total += cur.rowcount
+        return total
+
+    def get_forecasts(
+        self,
+        cloud_provider: Optional[str] = None,
+        service: Optional[str] = None,
+        horizon_days: Optional[int] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        model_used: str = "ensemble"
+    ) -> List[dict]:
+        """Returns forecast rows matching filters, ordered by forecast_date ASC."""
+        query = "SELECT * FROM forecasts WHERE model_used = %s"
+        params = [model_used]
+
+        if cloud_provider:
+            query += " AND cloud_provider = %s"
+            params.append(cloud_provider)
+        if service:
+            query += " AND service = %s"
+            params.append(service)
+        if horizon_days is not None:
+            query += " AND horizon_days = %s"
+            params.append(horizon_days)
+        if start_date:
+            query += " AND forecast_date >= %s"
+            params.append(start_date)
+        if end_date:
+            query += " AND forecast_date <= %s"
+            params.append(end_date)
+
+        query += " ORDER BY forecast_date ASC"
+
+        results = []
+        with DatabaseManager.get_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, tuple(params))
+                for row in cur.fetchall():
+                    results.append(dict(row))
+        return results
+
