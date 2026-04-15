@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+.env
+.venv/
+node_modules/
+dist/
+
+*.parquet
+*.csv
+output/
+
+.DS_Store
+*.egg-info/
