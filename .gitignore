@@ -12,3 +12,6 @@ output/
 
 .DS_Store
 *.egg-info/
+*.zip
+*/model_registry/
+scratch/
