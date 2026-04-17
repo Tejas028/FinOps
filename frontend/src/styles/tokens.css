@@ -1,0 +1,23 @@
+:root {
+  /* BACKGROUNDS */
+  --bg-base: #0A0A0F;
+  --bg-surface: #13131A;
+  --bg-elevated: #1C1C27;
+
+  /* BORDERS */
+  --border: #2A2A3D;
+
+  /* TEXT */
+  --text-primary: #E8E8F0;
+  --text-secondary: #7B7B96;
+
+  /* ACCENT (Amber) */
+  --accent: #F59E0B;
+  --accent-dim: #F59E0B30;
+  --accent-med: #F59E0B70;
+  --accent-full: #F59E0B;
+
+  /* STATUS (For Delta Arrows etc.) */
+  --green: #4ADE80;
+  --red: #F87171;
+}
