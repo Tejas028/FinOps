@@ -7,10 +7,10 @@ interface SpendByCloudChartProps {
 }
 
 const CLOUD_COLORS: Record<string, string> = {
-  aws: '#6366F1',
-  azure: '#8B5CF6',
-  gcp: '#06B6D4',
-  other: 'var(--text-secondary)'
+  aws: '#F59E0B',    // 100% amber
+  azure: '#D97706',  // Medium amber
+  gcp: '#92400E',    // Darkest amber
+  other: '#7B7B96'
 };
 
 const CustomTooltip = ({ active, payload }: any) => {

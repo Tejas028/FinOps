@@ -13,3 +13,6 @@ APP_VERSION = "0.1.0"
 API_HOST    = os.getenv("API_HOST", "0.0.0.0")
 API_PORT    = int(os.getenv("API_PORT", "8000"))
 LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")

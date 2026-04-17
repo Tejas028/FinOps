@@ -5,7 +5,7 @@ import psycopg2
 import time
 import logging
 
-from api.routers import health, billing, anomalies, forecasts, attribution, alerts
+from api.routers import health, billing, anomalies, forecasts, attribution, alerts, insights
 from api.dependencies import get_db
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +48,7 @@ app.include_router(anomalies.router,   prefix="/anomalies",  tags=["Anomalies"])
 app.include_router(forecasts.router,   prefix="/forecasts",  tags=["Forecasts"])
 app.include_router(attribution.router, prefix="/attribution",tags=["Attribution"])
 app.include_router(alerts.router,      prefix="/alerts",     tags=["Alerts"])
+app.include_router(insights.router,    prefix="/insights",   tags=["AI Insights"])
 
 @app.on_event("startup")
 async def startup_event():

@@ -5,54 +5,47 @@ interface SeverityBadgeProps {
 }
 
 export const SeverityBadge: React.FC<SeverityBadgeProps> = ({ severity }) => {
-  let background = 'transparent';
-  let color = 'var(--text-primary)';
-  let opacity = 1;
-  let fontWeight = 400;
+  const s = (severity || "LOW").toUpperCase();
+  
+  const styles: Record<string, React.CSSProperties> = {
+    LOW: {
+      background: 'rgba(123, 123, 150, 0.15)',
+      color: '#7B7B96',
+      border: '1px solid rgba(123, 123, 150, 0.3)',
+    },
+    MEDIUM: {
+      background: 'rgba(217, 119, 6, 0.15)',
+      color: '#D97706',
+      border: '1px solid rgba(217, 119, 6, 0.3)',
+    },
+    HIGH: {
+      background: 'rgba(245, 158, 11, 0.2)',
+      color: '#F59E0B',
+      border: '1px solid rgba(245, 158, 11, 0.4)',
+    },
+    CRITICAL: {
+      background: '#F59E0B',
+      color: '#0A0A0F',
+      border: 'none',
+      fontWeight: 600,
+    }
+  };
 
-  switch (severity.toLowerCase()) {
-    case 'low':
-      background = 'var(--accent-dim)';
-      color = 'var(--accent)';
-      break;
-    case 'medium':
-      background = 'var(--accent-med)';
-      color = 'var(--bg-base)';
-      opacity = 0.8;
-      break;
-    case 'high':
-      /* Use full accent at 60% approx via rgb breakdown, or rely on CSS classes if we had them. 
-         Wait, let's use a solid color but we only have --accent-full. 
-         We'll emulate 60% opacity of full accent on --bg-surface: */
-      background = 'color-mix(in srgb, var(--accent-full) 60%, transparent)';
-      color = 'var(--bg-base)';
-      break;
-    case 'critical':
-      background = 'var(--accent-full)';
-      color = 'var(--bg-base)';
-      fontWeight = 600;
-      break;
-    default:
-      background = 'var(--bg-elevated)';
-      color = 'var(--text-secondary)';
-  }
+  const currentStyle = styles[s] || styles.LOW;
 
   return (
     <span style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: '2px 8px',
-      borderRadius: '12px',
-      fontSize: '11px',
-      textTransform: 'uppercase',
-      letterSpacing: '0.5px',
-      background,
-      color,
-      opacity,
-      fontWeight
+      ...currentStyle,
+      padding: "2px 8px",
+      borderRadius: "4px",
+      fontSize: "11px",
+      fontWeight: currentStyle.fontWeight || 500,
+      letterSpacing: "0.05em",
+      textTransform: "uppercase",
+      display: "inline-block",
+      fontFamily: "monospace",
     }}>
-      {severity}
+      {s}
     </span>
   );
 };

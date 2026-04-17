@@ -6,6 +6,7 @@ import { SpendTrendChart } from '../components/charts/SpendTrendChart';
 import { DataTable, ColumnDef } from '../components/shared/DataTable';
 import { useFilterContext } from '../context/FilterContext';
 import { EmptyState } from '../components/shared/EmptyState';
+import { AIInsightPanel } from '../components/shared/AIInsightPanel';
 import type { AttributionItem } from '../types';
 
 export const AttributionPage: React.FC = () => {
@@ -134,6 +135,28 @@ export const AttributionPage: React.FC = () => {
                 </div>
               )}
               <h3 style={{ margin: '0 0 16px 0', fontSize: '13px', color: 'var(--text-secondary)' }}>Daily Driver Breakdown</h3>
+              
+              {selectedCloud && selectedService && attributionData.length > 0 && (
+                <AIInsightPanel 
+                  endpoint="/insights/attribution"
+                  payload={{
+                    cloud_provider: selectedCloud,
+                    service_category: selectedService,
+                    date: attributionData[0].attribution_date,
+                    total_cost_usd: attributionData[0].total_cost_usd,
+                    shap_values: attributionData[0].shap_values,
+                    top_driver_1: attributionData[0].top_driver_1,
+                    top_driver_1_value: attributionData[0].top_driver_1_value,
+                    top_driver_2: attributionData[0].top_driver_2,
+                    top_driver_2_value: attributionData[0].top_driver_2_value,
+                    top_driver_3: attributionData[0].top_driver_3,
+                    top_driver_3_value: attributionData[0].top_driver_3_value,
+                  }}
+                  trigger={`${selectedCloud}-${selectedService}-${attributionData[0].attribution_date}`}
+                  className="mb-4"
+                />
+              )}
+
               <DataTable 
                 columns={tableColumns}
                 data={attributionData}

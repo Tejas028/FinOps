@@ -17,6 +17,9 @@ interface DataTableProps<T> {
   onPageChange?: (page: number) => void;
   loading?: boolean;
   onRowClick?: (item: T) => void;
+  renderExpandedRow?: (item: T) => React.ReactNode;
+  expandedRowId?: string | number | null;
+  getRowId?: (item: T) => string | number;
 }
 
 export function DataTable<T>({
@@ -27,7 +30,10 @@ export function DataTable<T>({
   pageSize = 20,
   onPageChange,
   loading,
-  onRowClick
+  onRowClick,
+  renderExpandedRow,
+  expandedRowId,
+  getRowId
 }: DataTableProps<T>) {
 
   if (loading && data.length === 0) {
@@ -67,27 +73,54 @@ export function DataTable<T>({
           </tr>
         </thead>
         <tbody>
-          {data.map((item, idx) => (
-            <tr 
-              key={idx} 
-              onClick={() => onRowClick?.(item)}
-              style={{
-                borderBottom: '1px solid color-mix(in srgb, var(--border) 50%, transparent)',
-                cursor: onRowClick ? 'pointer' : 'default',
-                transition: 'background 0.2s ease',
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
-            >
-              {columns.map((col) => (
-                <td key={col.key} style={{ padding: '12px 16px', fontSize: '13px', color: 'var(--text-primary)' }}>
-                  {col.render(item)}
-                </td>
-              ))}
-            </tr>
-          ))}
+          {data.map((item, idx) => {
+            const isExpanded = getRowId && expandedRowId === getRowId(item);
+            
+            return (
+              <React.Fragment key={getRowId ? getRowId(item) : idx}>
+                <tr 
+                  onClick={() => onRowClick?.(item)}
+                  style={{
+                    borderBottom: isExpanded ? 'none' : '1px solid color-mix(in srgb, var(--border) 50%, transparent)',
+                    cursor: onRowClick ? 'pointer' : 'default',
+                    transition: 'background 0.2s ease',
+                    borderLeft: isExpanded ? '2px solid #F59E0B' : '2px solid transparent',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                  {columns.map((col) => (
+                    <td key={col.key} style={{ padding: '12px 16px', fontSize: '13px', color: 'var(--text-primary)' }}>
+                      {col.render(item)}
+                    </td>
+                  ))}
+                </tr>
+                {isExpanded && renderExpandedRow && (
+                  <tr>
+                    <td colSpan={columns.length} style={{
+                      padding: '12px 16px 12px 48px',
+                      background: '#0F0F16',
+                      borderBottom: '1px solid var(--border)',
+                      borderLeft: '2px solid #F59E0B',
+                    }}>
+                      <div style={{ animation: 'slideIn 0.2s ease' }}>
+                        {renderExpandedRow(item)}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
         </tbody>
       </table>
+
+      <style>{`
+        @keyframes slideIn {
+          from { opacity: 0; transform: translateY(-10px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+      `}</style>
 
       {onPageChange && (total > pageSize) && (
         <div style={{
