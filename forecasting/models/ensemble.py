@@ -114,7 +114,7 @@ class EnsembleForecaster:
                     forecast_id=str(uuid.uuid4()),
                     cloud_provider=base.cloud_provider,
                     service=base.service,
-                    region=None,
+                    region="all",
                     horizon_days=h_days,
                     forecast_date=base.forecast_date,
                     predicted_cost=max(0.0, pred),

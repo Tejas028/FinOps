@@ -31,6 +31,7 @@ def main():
     engine = ForecastingEngine(storage_client=storage_client, force_retrain=args.force_retrain)
     
     # Run
+    print("\n[DEBUG] CALLING ENGINE.RUN NOW\n")
     try:
         engine.run(
             cloud_provider=args.cloud,

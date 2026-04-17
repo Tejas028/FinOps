@@ -1,5 +1,7 @@
 import time
+import logging
 import json
+import os
 import psycopg2.extras
 from typing import List, Optional, Dict, Any
 from datetime import date
@@ -470,6 +472,8 @@ class StorageClient:
         """
         if not forecasts:
             return 0
+        
+        logging.info(f"Attempting to write {len(forecasts)} forecasts...")
 
         query = """
         INSERT INTO forecasts (
@@ -496,14 +500,23 @@ class StorageClient:
             ))
 
         total = 0
-        batch_size = 1000
-        with DatabaseManager.get_connection() as conn:
-            with conn.cursor() as cur:
-                for i in range(0, len(values), batch_size):
-                    batch = values[i:i + batch_size]
-                    psycopg2.extras.execute_values(cur, query, batch, page_size=1000)
-                    total += cur.rowcount
-        return total
+        batch_size = 100
+        
+        try:
+            with DatabaseManager.get_connection() as conn:
+                with conn.cursor() as cur:
+                    for i in range(0, len(values), batch_size):
+                        batch = values[i:i + batch_size]
+                        psycopg2.extras.execute_values(cur, query, batch, page_size=100)
+                        # Fallback for cur.rowcount
+                        actual_count = cur.rowcount if cur.rowcount >= 0 else len(batch)
+                        total += actual_count
+            
+            logging.info(f"Successfully synced {total} forecasts to database.")
+            return total
+        except Exception as e:
+            logging.error(f"Failed to write forecasts: {e}")
+            raise
 
     def get_forecasts(
         self,

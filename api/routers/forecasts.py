@@ -191,7 +191,16 @@ async def get_budget_risk(
             rows = cur.fetchall()
             
     if not rows:
-        raise HTTPException(status_code=404, detail="No forecasts found for risk analysis")
+        return {
+            "cloud_provider": cloud_provider,
+            "monthly_budget_usd": monthly_budget_usd,
+            "projected_monthly_cost": 0.0,
+            "breach_risk": "none",
+            "breach_date": None,
+            "days_to_breach": None,
+            "confidence_pct": 0.0,
+            "message": "No forecast data available"
+        }
         
     cum_pred = 0.0
     cum_lower = 0.0
