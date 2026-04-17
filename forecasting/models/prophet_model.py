@@ -53,6 +53,19 @@ class ProphetModel(BaseForecastModel):
         # Add epsilon to y_true to prevent inf MAPE cleanly
         mape = mean_absolute_percentage_error(y_true + 1e-9, y_pred)
 
+        # RETRAIN ON FULL DATASET before making final predictions
+        # This ensures the "future" starts at the actual end of the available data.
+        self.model = Prophet(
+            changepoint_prior_scale=config.PROPHET_CHANGEPOINT_PRIOR_SCALE,
+            seasonality_prior_scale=config.PROPHET_SEASONALITY_PRIOR_SCALE,
+            yearly_seasonality=config.PROPHET_YEARLY_SEASONALITY,
+            weekly_seasonality=config.PROPHET_WEEKLY_SEASONALITY,
+            daily_seasonality=config.PROPHET_DAILY_SEASONALITY,
+            interval_width=config.PROPHET_INTERVAL_WIDTH,
+            mcmc_samples=config.PROPHET_MCMC_SAMPLES
+        )
+        self.model.fit(pdf)
+
         self.metadata = {
             "model_type": "prophet",
             "train_size": train_size,

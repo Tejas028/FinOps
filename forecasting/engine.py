@@ -60,12 +60,9 @@ class ForecastingEngine:
 
         if df.empty:
             logger.warning("No data found for the given criteria.")
-            print("No data found.")
+            print("No data found in spend_features.")
             return []
             
-        # Rename legacy aliases if any in DB just in case (lag_1d missing handling from pandas end if columns are slightly different)
-        # We explicitly aliased in SQL, so it's fine.
-
         # Step 2: PREPARE PER-GROUP DataFrames
         groups = df.groupby(['cloud_provider', 'service'])
         

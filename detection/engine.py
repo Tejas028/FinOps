@@ -63,23 +63,32 @@ class DetectionEngine:
                 self.iforest.fit(df)
                 self.iforest.save(config.MODEL_REGISTRY_PATH)
 
-            if force_retrain or not self.lstm.models:
-                print("Training LSTM models...")
-                self.lstm.fit(df)
-                self.lstm.save(config.MODEL_REGISTRY_PATH)
+            if config.ENSEMBLE_WEIGHT_LSTM > 0:
+                if force_retrain or not self.lstm.models:
+                    print("Training LSTM models...")
+                    self.lstm.fit(df)
+                    self.lstm.save(config.MODEL_REGISTRY_PATH)
 
         # Step 3: If predict-only, load saved models
         if self.mode == "predict":
             self.iforest.load(config.MODEL_REGISTRY_PATH)
-            self.lstm.load(config.MODEL_REGISTRY_PATH)
+            if config.ENSEMBLE_WEIGHT_LSTM > 0:
+                self.lstm.load(config.MODEL_REGISTRY_PATH)
 
         # Step 4: Run all detectors
         print("Running Z-Score detector...")
         zscore_results = self.zscore.predict(df)
         print("Running IsolationForest detector...")
         iforest_results = self.iforest.predict(df)
-        print("Running LSTM detector...")
-        lstm_results = self.lstm.predict(df)
+        
+        lstm_results = []
+        if config.ENSEMBLE_WEIGHT_LSTM > 0:
+            print("Running LSTM detector...")
+            lstm_results = self.lstm.predict(df)
+        else:
+            print("Skipping LSTM detector (weight = 0).")
+            # If skipping, we need a list of None to keep indices aligned for the map
+            lstm_results = [None] * len(df)
 
         # Build lookup maps by index
         zscore_map = {i: r for i, r in enumerate(zscore_results)}

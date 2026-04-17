@@ -106,10 +106,15 @@ class IsolationForestDetector(BaseDetector):
                     self.score_ranges[key] = joblib.load(range_file)
 
     def _extract_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
-        cols = [c for c in config.IFOREST_FEATURE_COLS if c in df.columns]
-        if not cols:
-            return None
-        subset = df[cols].copy()
+        cols = config.IFOREST_FEATURE_COLS
+        # Ensure all columns exist in DF, even if empty (fill with 0)
+        subset = pd.DataFrame(index=df.index)
+        for c in cols:
+            if c in df.columns:
+                subset[c] = df[c]
+            else:
+                subset[c] = 0.0
+        
         # Convert booleans to int
         for c in subset.columns:
             if subset[c].dtype == bool:

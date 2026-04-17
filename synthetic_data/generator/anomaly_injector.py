@@ -12,14 +12,21 @@ from .azure_generator import AZURE_SERVICES, AZURE_REGIONS
 from .gcp_generator import GCP_SERVICES, GCP_REGIONS
 from .base_generator import get_baseline_multiplier, get_rng
 
-def build_anomaly_schedule() -> Tuple[Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]], List[Dict[str, Any]]]:
+def build_anomaly_schedule(
+    start_override: str = None,
+    end_override: str = None
+) -> Tuple[Dict[str, Dict[Tuple[str, str, str], Dict[str, Any]]], List[Dict[str, Any]]]:
     """
     Builds the global AnomalySchedule table.
     schedule[date_str][(cloud, service, region)] = { multiplier, anomaly_id, type, severity }
+
+    Args:
+        start_override: Optional ISO date string (YYYY-MM-DD). If provided, overrides DATE_RANGE_START from config.
+        end_override:   Optional ISO date string (YYYY-MM-DD). If provided, overrides DATE_RANGE_END from config.
     """
     rng = get_rng()
-    start_date = datetime.date.fromisoformat(DATE_RANGE_START)
-    end_date = datetime.date.fromisoformat(DATE_RANGE_END)
+    start_date = datetime.date.fromisoformat(start_override or DATE_RANGE_START)
+    end_date = datetime.date.fromisoformat(end_override or DATE_RANGE_END)
     delta = end_date - start_date
     total_days = delta.days + 1
     dates = [start_date + datetime.timedelta(days=i) for i in range(total_days)]

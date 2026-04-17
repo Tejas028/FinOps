@@ -222,7 +222,10 @@ def main(cloud, start, end, seed, no_anomalies, no_edge_cases, output_dir, out_f
         # Ensure base generator seed is synced
         import generator.base_generator as bg
         bg.RANDOM_SEED = seed # For get_rng inner working if used
-        schedule, manifest = build_anomaly_schedule()
+        schedule, manifest = build_anomaly_schedule(
+            start_override=start,
+            end_override=end
+        )
         
     # Month by month generation chunked
     current_chunk_start = start_d

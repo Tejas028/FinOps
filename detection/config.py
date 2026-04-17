@@ -40,9 +40,9 @@ LSTM_FEATURE_COLS = [
 ]
 
 # ─── Ensemble Scorer ─────────────────────────────────────────
-ENSEMBLE_WEIGHT_ZSCORE    = 0.30
-ENSEMBLE_WEIGHT_IFOREST   = 0.35
-ENSEMBLE_WEIGHT_LSTM      = 0.35
+ENSEMBLE_WEIGHT_ZSCORE    = 0.45
+ENSEMBLE_WEIGHT_IFOREST   = 0.55
+ENSEMBLE_WEIGHT_LSTM      = 0.00
 
 SEVERITY_THRESHOLDS = {
     "low":      0.30,
