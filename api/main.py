@@ -47,6 +47,15 @@ async def global_exception_handler(request: Request, exc: Exception):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
+@app.get("/")
+async def root():
+    return {
+        "message": "Cloud FinOps Intelligence API is running",
+        "docs": "/docs",
+        "health": "/health",
+        "status": "active"
+    }
+
 # Mount all routers
 app.include_router(health.router,      prefix="",            tags=["Health"])
 app.include_router(billing.router,     prefix="/billing",    tags=["Billing"])
