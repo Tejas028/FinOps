@@ -1,6 +1,7 @@
 import React from 'react';
 import { Skeleton } from './Skeleton';
 import { EmptyState } from './EmptyState';
+import { PageSizeSelector } from './PageSizeSelector';
 
 export interface ColumnDef<T> {
   key: string;
@@ -15,6 +16,7 @@ interface DataTableProps<T> {
   page?: number;
   pageSize?: number;
   onPageChange?: (page: number) => void;
+  onPageSizeChange?: (size: number) => void;
   loading?: boolean;
   onRowClick?: (item: T) => void;
   renderExpandedRow?: (item: T) => React.ReactNode;
@@ -27,8 +29,9 @@ export function DataTable<T>({
   data,
   total = 0,
   page = 1,
-  pageSize = 20,
+  pageSize = 25,
   onPageChange,
+  onPageSizeChange,
   loading,
   onRowClick,
   renderExpandedRow,
@@ -122,38 +125,52 @@ export function DataTable<T>({
         }
       `}</style>
 
-      {onPageChange && (total > pageSize) && (
+      {onPageChange && (
         <div style={{
           display: 'flex',
-          justifyContent: 'flex-end',
+          justifyContent: 'space-between',
           alignItems: 'center',
           padding: '16px',
-          gap: '16px',
-          fontSize: '13px',
-          color: 'var(--text-secondary)'
+          borderTop: '1px solid var(--border)',
+          background: 'var(--bg-surface)'
         }}>
-          <span>Page {page} of {Math.ceil(total / pageSize)} ({total} total)</span>
-          <div style={{ display: 'flex', gap: '8px' }}>
-            <button
-              disabled={!hasPrev}
-              onClick={() => hasPrev && onPageChange(page - 1)}
-              style={{
-                background: 'transparent', border: 'none', color: hasPrev ? 'var(--text-primary)' : 'var(--text-secondary)',
-                cursor: hasPrev ? 'pointer' : 'not-allowed'
-              }}
-            >
-              Prev
-            </button>
-            <button
-              disabled={!hasNext}
-              onClick={() => hasNext && onPageChange(page + 1)}
-              style={{
-                background: 'transparent', border: 'none', color: hasNext ? 'var(--text-primary)' : 'var(--text-secondary)',
-                cursor: hasNext ? 'pointer' : 'not-allowed'
-              }}
-            >
-              Next
-            </button>
+          <div>
+            {onPageSizeChange && (
+              <PageSizeSelector value={pageSize} onChange={onPageSizeChange} />
+            )}
+          </div>
+          
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '16px',
+            fontSize: '13px',
+            color: 'var(--text-secondary)'
+          }}>
+            <span>Page {page} of {Math.ceil(total / pageSize)}</span>
+            <div style={{ width: '1px', height: '16px', background: 'var(--border)' }} />
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                disabled={!hasPrev}
+                onClick={() => hasPrev && onPageChange(page - 1)}
+                style={{
+                  background: 'transparent', border: 'none', color: hasPrev ? 'var(--text-primary)' : 'var(--text-secondary)',
+                  cursor: hasPrev ? 'pointer' : 'not-allowed', padding: '4px 8px'
+                }}
+              >
+                &lt; Prev
+              </button>
+              <button
+                disabled={!hasNext}
+                onClick={() => hasNext && onPageChange(page + 1)}
+                style={{
+                  background: 'transparent', border: 'none', color: hasNext ? 'var(--text-primary)' : 'var(--text-secondary)',
+                  cursor: hasNext ? 'pointer' : 'not-allowed', padding: '4px 8px'
+                }}
+              >
+                Next &gt;
+              </button>
+            </div>
           </div>
         </div>
       )}

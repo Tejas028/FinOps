@@ -1,0 +1,14 @@
+{
+  "aws": {
+    "last_ingested_date": "2026-12-31",
+    "total_records": 58758
+  },
+  "azure": {
+    "last_ingested_date": "2026-12-31",
+    "total_records": 44053
+  },
+  "gcp": {
+    "last_ingested_date": "2026-12-31",
+    "total_records": 36723
+  }
+}

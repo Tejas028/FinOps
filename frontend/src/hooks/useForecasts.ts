@@ -13,7 +13,7 @@ export const useForecasts = (horizonDays: number = 30, service?: string) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
-  const fetchForecasts = useCallback(async () => {
+  const fetchForecasts = useCallback(async (page = 1, pageSize = 25) => {
     setLoading(true);
     setError(null);
     try {
@@ -24,7 +24,7 @@ export const useForecasts = (horizonDays: number = 30, service?: string) => {
       };
       
       const [fPage, latest] = await Promise.all([
-        getForecasts({ ...p, page: 1, page_size: 100 }),
+        getForecasts({ ...p, page, page_size: pageSize }),
         getLatestForecasts(p)
       ]);
       
@@ -62,5 +62,5 @@ export const useForecasts = (horizonDays: number = 30, service?: string) => {
     fetchForecasts();
   }, [fetchForecasts]);
 
-  return { forecastsPage, latestList, budgetRisk, setBudgetRisk, loading, error, fetchBudgetRisk };
+  return { forecastsPage, latestList, budgetRisk, setBudgetRisk, loading, error, fetchBudgetRisk, fetchForecasts };
 };

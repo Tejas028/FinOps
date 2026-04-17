@@ -7,6 +7,8 @@ import { DataTable, ColumnDef } from '../components/shared/DataTable';
 import { useFilterContext } from '../context/FilterContext';
 import { EmptyState } from '../components/shared/EmptyState';
 import { AIInsightPanel } from '../components/shared/AIInsightPanel';
+import { ExportButton } from '../components/shared/ExportButton';
+import { exportToCsv } from '../utils/exportCsv';
 import type { AttributionItem } from '../types';
 
 export const AttributionPage: React.FC = () => {
@@ -134,7 +136,27 @@ export const AttributionPage: React.FC = () => {
                   <SpendTrendChart data={trendData} loading={loadingAttribution} />
                 </div>
               )}
-              <h3 style={{ margin: '0 0 16px 0', fontSize: '13px', color: 'var(--text-secondary)' }}>Daily Driver Breakdown</h3>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3 style={{ margin: 0, fontSize: '13px', color: 'var(--text-secondary)' }}>Daily Driver Breakdown</h3>
+                <ExportButton 
+                  onClick={() => {
+                    const exportData = attributionData.map(a => ({
+                      attribution_date: a.attribution_date,
+                      cloud_provider: a.cloud_provider,
+                      service_category: a.service_category,
+                      total_cost_usd: a.total_cost_usd,
+                      top_driver_1: a.top_driver_1,
+                      top_driver_1_value: a.top_driver_1_value,
+                      top_driver_2: a.top_driver_2,
+                      top_driver_2_value: a.top_driver_2_value,
+                      top_driver_3: a.top_driver_3,
+                      top_driver_3_value: a.top_driver_3_value,
+                    }));
+                    exportToCsv("attribution.csv", exportData);
+                  }} 
+                  disabled={attributionData.length === 0} 
+                />
+              </div>
               
               {selectedCloud && selectedService && attributionData.length > 0 && (
                 <AIInsightPanel 

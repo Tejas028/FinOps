@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { MetricCard } from '../components/shared/MetricCard';
 import { SpendTrendChart } from '../components/charts/SpendTrendChart';
 import { SpendByCloudChart } from '../components/charts/SpendByCloudChart';
@@ -15,34 +15,50 @@ export const OverviewPage: React.FC = () => {
   const { byCloud, trend, loading: loadingBilling } = useBilling();
   const { summary: anomalySummary, recent, loading: loadingAnomalies } = useAnomalies();
   const { latestList, budgetRisk, loading: loadingForecasts } = useForecasts(30);
-  const { summary: alertsSummary } = useAlerts();
+  const { summary: alertsSummary, loading: loadingAlerts } = useAlerts();
 
   // Compute metric sums from data
-  let totalSpend = 0;
-  if (Array.isArray(byCloud)) {
-    totalSpend = byCloud.reduce((sum, item) => sum + item.total_cost_usd, 0);
-  }
+  const totalSpend = useMemo(() => {
+    if (!Array.isArray(byCloud)) return 0;
+    return byCloud.reduce((sum, item) => sum + item.total_cost_usd, 0);
+  }, [byCloud]);
 
-  let totalForecast = 0;
-  if (Array.isArray(latestList) && latestList.length > 0) {
-    totalForecast = latestList.reduce((sum, item) => sum + item.predicted_cost, 0);
-  }
+  const totalForecast = useMemo(() => {
+    if (!Array.isArray(latestList) || latestList.length === 0) return 0;
+    return latestList.reduce((sum, item) => sum + item.predicted_cost, 0);
+  }, [latestList]);
 
-  const aiPayload = (byCloud && anomalySummary && latestList && alertsSummary) ? {
-    date_range_start: startDate,
-    date_range_end: endDate,
-    total_spend: totalSpend,
-    anomaly_count: anomalySummary.total_anomalies,
-    critical_count: anomalySummary.by_severity.critical || 0,
-    high_count: anomalySummary.by_severity.high || 0,
-    forecast_30d: latestList[0]?.predicted_cost || 0,
-    by_cloud: Object.fromEntries((byCloud || []).map(c => [c.dimension, c.total_cost_usd])),
-    top_anomaly_cloud: Object.entries(anomalySummary.by_cloud || {})
-                         .sort((a,b) => (b[1] as number) - (a[1] as number))[0]?.[0] || null,
-    unresolved_alerts: alertsSummary.unresolved || 0,
-  } : null;
+  // Construct AI Payload ONLY when all data sources are NOT loading
+  // This ensures the data matches the current filter (startDate/endDate/cloud)
+  const aiPayload = useMemo(() => {
+    const isLoaded = !loadingBilling && !loadingAnomalies && !loadingForecasts && !loadingAlerts;
+    if (!isLoaded || !byCloud || !anomalySummary || !latestList || !alertsSummary) return null;
 
-  const aiTrigger = `${startDate}-${endDate}-${cloud}`;
+    const clouds = (byCloud || []).map(c => [c.dimension, c.total_cost_usd]);
+    const anomaliesByCloud = Object.entries(anomalySummary.by_cloud || {});
+    
+    return {
+      date_range_start: startDate,
+      date_range_end: endDate,
+      active_cloud_filter: cloud,
+      total_spend: totalSpend,
+      anomaly_count: anomalySummary.total_anomalies,
+      critical_count: anomalySummary.by_severity.critical || 0,
+      high_count: anomalySummary.by_severity.high || 0,
+      forecast_30d: totalForecast,
+      by_cloud: Object.fromEntries(clouds),
+      top_anomaly_cloud: anomaliesByCloud.length > 0 
+        ? anomaliesByCloud.sort((a,b) => (b[1] as number) - (a[1] as number))[0][0] 
+        : null,
+      unresolved_alerts: alertsSummary.unresolved || 0,
+    };
+  }, [
+    loadingBilling, loadingAnomalies, loadingForecasts, loadingAlerts,
+    startDate, endDate, cloud, totalSpend, totalForecast,
+    byCloud, anomalySummary, latestList, alertsSummary
+  ]);
+
+  const aiTrigger = useMemo(() => `${startDate}-${endDate}-${cloud}`, [startDate, endDate, cloud]);
 
   let budgetRiskColor = 'var(--text-secondary)';
   if (budgetRisk?.breach_risk === 'possible') budgetRiskColor = 'var(--accent-med)';

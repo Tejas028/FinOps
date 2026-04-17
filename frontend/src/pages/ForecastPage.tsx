@@ -9,6 +9,8 @@ import type { ForecastItem, SpendByDimension } from '../types';
 export const ForecastPage: React.FC = () => {
   const { cloud, startDate, endDate } = useFilterContext();
   const [horizonDays, setHorizonDays] = useState<number>(30);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   
   // Section A Data (Aggregated Cloud)
   const { latestList: aggregateForecasts, loading: loadingAggregate } = useForecasts(horizonDays);
@@ -76,7 +78,17 @@ export const ForecastPage: React.FC = () => {
     return () => { active = false; };
   }, [cloud, startDate, endDate]);
 
-  const { latestList: serviceForecasts, forecastsPage, loading: loadingService } = useForecasts(horizonDays, selectedService || undefined);
+  const { latestList: serviceForecasts, forecastsPage, loading: loadingService, fetchForecasts } = useForecasts(horizonDays, selectedService || undefined);
+
+  // Sync pagination
+  useEffect(() => {
+    fetchForecasts(page, pageSize);
+  }, [page, pageSize, fetchForecasts]);
+
+  // Reset page
+  useEffect(() => {
+    setPage(1);
+  }, [horizonDays, selectedService, pageSize]);
 
   const horizonOptions = [7, 14, 30, 90];
 
@@ -236,10 +248,12 @@ export const ForecastPage: React.FC = () => {
         </div>
         <DataTable 
           columns={columns}
-          data={forecastsPage?.data || serviceForecasts || []}
+          data={forecastsPage?.data || []}
           total={forecastsPage?.total || 0}
-          page={forecastsPage?.page || 1}
-          pageSize={forecastsPage?.page_size || 100}
+          page={page}
+          pageSize={pageSize}
+          onPageChange={setPage}
+          onPageSizeChange={setPageSize}
           loading={loadingService}
         />
       </div>

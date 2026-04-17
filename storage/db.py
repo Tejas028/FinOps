@@ -14,9 +14,8 @@ class DatabaseManager:
     def initialize(cls) -> None:
         """
         Initialize the connection pool. Call once at startup.
-        Reads from env: TIMESCALE_HOST, TIMESCALE_PORT, TIMESCALE_DB,
-        TIMESCALE_USER, TIMESCALE_PASSWORD, TIMESCALE_POOL_MIN,
-        TIMESCALE_POOL_MAX
+        Prioritizes DATABASE_URL if present (standard for Render/Heroku).
+        Otherwise reads individual params.
         """
         if cls._pool is not None:
             return
@@ -24,17 +23,28 @@ class DatabaseManager:
         min_conn = int(os.getenv("TIMESCALE_POOL_MIN", 2))
         max_conn = int(os.getenv("TIMESCALE_POOL_MAX", 10))
         
+        db_url = os.getenv("DATABASE_URL")
+        
         try:
-            cls._pool = pool.ThreadedConnectionPool(
-                minconn=min_conn,
-                maxconn=max_conn,
-                host=os.getenv("TIMESCALE_HOST", "localhost"),
-                port=os.getenv("TIMESCALE_PORT", "5432"),
-                dbname=os.getenv("TIMESCALE_DB", "finops"),
-                user=os.getenv("TIMESCALE_USER", "finops_user"),
-                password=os.getenv("TIMESCALE_PASSWORD", "finops_pass")
-            )
-            logging.info("Database connection pool initialized.")
+            if db_url:
+                # Use DSN string for initialization
+                cls._pool = pool.ThreadedConnectionPool(
+                    minconn=min_conn,
+                    maxconn=max_conn,
+                    dsn=db_url
+                )
+                logging.info("Database connection pool initialized using DATABASE_URL.")
+            else:
+                cls._pool = pool.ThreadedConnectionPool(
+                    minconn=min_conn,
+                    maxconn=max_conn,
+                    host=os.getenv("TIMESCALE_HOST", "localhost"),
+                    port=os.getenv("TIMESCALE_PORT", "5432"),
+                    dbname=os.getenv("TIMESCALE_DB", "finops"),
+                    user=os.getenv("TIMESCALE_USER", "finops_user"),
+                    password=os.getenv("TIMESCALE_PASSWORD", "finops_pass")
+                )
+                logging.info("Database connection pool initialized using individual params.")
         except Exception as e:
             logging.error(f"Failed to initialize database pool: {e}")
             raise

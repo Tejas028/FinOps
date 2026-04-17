@@ -14,4 +14,10 @@ output/
 *.egg-info/
 *.zip
 */model_registry/
+.env.production
+.env.local
+**/model_registry/*.joblib
+synthetic_data/output/
+synthetic_data/output_2526/
+test_output.txt
 scratch/

@@ -1,0 +1,3005 @@
+PROMPT-8:
+╔══════════════════════════════════════════════════════════════════╗
+║        PROMPT 8: SHAP Attribution Engine                         ║
+║        Cloud FinOps Intelligence Platform                        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+OBJECTIVE
+─────────
+Build the cost attribution engine that explains WHY cloud spend
+changed using SHAP (SHapley Additive exPlanations). It trains a
+LightGBM regressor per (cloud × service_category) group on
+spend_features, then generates SHAP values that attribute cost
+changes to specific drivers (lag spikes, regional shifts, tag
+changes, day-of-week effects, etc.).
+
+Outputs are persisted to a new `cost_attributions` table and
+consumed by Module 9 (FastAPI) and Module 11 (Dashboard).
+
+Module lives at: attribution/
+
+LOCKED CONTRACTS — DO NOT MODIFY
+─────────────────────────────────
+- shared/schemas/normalized.py  — NormalizedRecord
+- shared/schemas/anomaly.py     — AnomalyResult
+- storage/client.py             — StorageClient (extend minimally)
+- ingestion/, normalization/, detection/, forecasting/ — UNTOUCHED
+- TimescaleDB: host=127.0.0.1, port=5433, db=finops,
+  user=finops_user, password=finops_pass
+- spend_features queried as:
+    SELECT feature_date AS usage_date,
+           SUM(total_cost_usd) AS cost_usd, ...
+  Use this alias pattern consistently.
+
+══════════════════════════════════════════════════════════════════
+STEP 1 — DB SCHEMA
+══════════════════════════════════════════════════════════════════
+
+File: attribution/init_db/attribution_schema.sql  (idempotent)
+
+CREATE TABLE IF NOT EXISTS cost_attributions (
+    attribution_date    DATE            NOT NULL,
+    cloud_provider      TEXT            NOT NULL,
+    service_category    TEXT            NOT NULL,
+    account_id          TEXT            NOT NULL,
+    environment         TEXT            NOT NULL DEFAULT 'unknown',
+    team                TEXT            NOT NULL DEFAULT 'unknown',
+
+    -- Total cost on this date for this group
+    total_cost_usd      DOUBLE PRECISION NOT NULL,
+
+    -- Top SHAP drivers (stored as JSONB — key: feature_name, value: shap_value)
+    -- Example: {"cost_lag_7d": 42.3, "rolling_mean_30d": -12.1, "is_weekend": 5.2}
+    shap_values         JSONB           NOT NULL,
+
+    -- Top 3 drivers by absolute SHAP (for fast API queries)
+    top_driver_1        TEXT,           -- feature name
+    top_driver_1_value  DOUBLE PRECISION,
+    top_driver_2        TEXT,
+    top_driver_2_value  DOUBLE PRECISION,
+    top_driver_3        TEXT,
+    top_driver_3_value  DOUBLE PRECISION,
+
+    -- Model metadata
+    model_r2_score      DOUBLE PRECISION,
+    feature_count       INTEGER,
+    computed_at         TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (attribution_date, cloud_provider, service_category,
+                 account_id, environment, team)
+);
+
+SELECT create_hypertable(
+    'cost_attributions', 'attribution_date',
+    chunk_time_interval => INTERVAL '30 days',
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_attr_cloud_date
+    ON cost_attributions (cloud_provider, attribution_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_attr_service_date
+    ON cost_attributions (service_category, attribution_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_attr_top_driver
+    ON cost_attributions (top_driver_1, attribution_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_attr_shap_gin
+    ON cost_attributions USING GIN (shap_values);
+
+══════════════════════════════════════════════════════════════════
+STEP 2 — PYDANTIC SCHEMA
+══════════════════════════════════════════════════════════════════
+
+File: shared/schemas/attribution.py  (NEW — add to shared/schemas/)
+
+from pydantic import BaseModel
+from typing import Dict, Optional
+from datetime import date, datetime
+
+class AttributionRecord(BaseModel):
+    attribution_date:   date
+    cloud_provider:     str
+    service_category:   str
+    account_id:         str
+    environment:        str = "unknown"
+    team:               str = "unknown"
+    total_cost_usd:     float
+    shap_values:        Dict[str, float]   # all feature SHAP values
+    top_driver_1:       Optional[str]
+    top_driver_1_value: Optional[float]
+    top_driver_2:       Optional[str]
+    top_driver_2_value: Optional[float]
+    top_driver_3:       Optional[str]
+    top_driver_3_value: Optional[float]
+    model_r2_score:     Optional[float]
+    feature_count:      Optional[int]
+    computed_at:        datetime = None
+
+    class Config:
+        json_encoders = {date: str, datetime: str}
+
+══════════════════════════════════════════════════════════════════
+STEP 3 — FEATURES USED FOR SHAP
+══════════════════════════════════════════════════════════════════
+
+File: attribution/config.py
+
+SHAP_FEATURE_COLUMNS = [
+    "cost_lag_1d", "cost_lag_7d", "cost_lag_30d",
+    "rolling_mean_7d", "rolling_std_7d",
+    "rolling_mean_30d", "rolling_std_30d",
+    "pct_change_1d", "pct_change_7d", "pct_change_30d",
+    "z_score_30d",
+    "day_of_week", "day_of_month", "week_of_year",
+    "month", "is_weekend", "is_month_start", "is_month_end",
+    "record_count"
+]
+
+TARGET_COLUMN = "total_cost_usd"
+
+# Model training
+MIN_ROWS_FOR_TRAINING = 45      # skip groups with fewer rows
+TRAIN_RATIO = 0.70
+VAL_RATIO   = 0.15              # remaining 15% = test
+LGBM_PARAMS = {
+    "objective": "regression",
+    "metric": "rmse",
+    "n_estimators": 500,
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_child_samples": 5,
+    "early_stopping_rounds": 20,
+    "verbose": -1
+}
+MODEL_REGISTRY_PATH = "attribution/model_registry"
+
+══════════════════════════════════════════════════════════════════
+STEP 4 — ATTRIBUTION MODEL (LightGBM + SHAP)
+══════════════════════════════════════════════════════════════════
+
+File: attribution/model.py
+
+import lightgbm as lgb
+import shap
+import pandas as pd
+import numpy as np
+import joblib, os
+from attribution.config import *
+
+class AttributionModel:
+    """
+    Per-(cloud × service_category) LightGBM regressor.
+    Trained on spend_features. SHAP explains each prediction.
+    """
+
+    def __init__(self, cloud_provider: str, service_category: str):
+        self.cloud_provider    = cloud_provider
+        self.service_category  = service_category
+        self.model             = None
+        self.explainer         = None
+        self.r2_score_         = None
+        self._model_path       = os.path.join(
+            MODEL_REGISTRY_PATH,
+            f"{cloud_provider}__{service_category}.joblib"
+        )
+        self._explainer_path   = os.path.join(
+            MODEL_REGISTRY_PATH,
+            f"{cloud_provider}__{service_category}__explainer.joblib"
+        )
+
+    def fit(self, df: pd.DataFrame) -> dict:
+        """
+        Input df: rows from spend_features for this group,
+                  sorted by usage_date ASC, NaN-filled.
+
+        Steps:
+        1. Select SHAP_FEATURE_COLUMNS as X, TARGET_COLUMN as y
+        2. Fill remaining NaN: X.fillna(0) — SHAP requires no NaN
+        3. Time-ordered split (NO shuffle):
+             train: first 70%, val: next 15%, test: last 15%
+        4. Train LightGBM with early_stopping on val set:
+             lgb.train(LGBM_PARAMS, train_set, valid_sets=[val_set],
+                       callbacks=[lgb.early_stopping(20),
+                                  lgb.log_evaluation(50)])
+        5. Evaluate R² on test set (sklearn.metrics.r2_score)
+        6. Build SHAP TreeExplainer:
+             self.explainer = shap.TreeExplainer(self.model)
+        7. Save model + explainer with joblib
+        8. Return: {"r2": float, "best_iteration": int,
+                    "train_rows": int, "test_rows": int}
+        """
+
+    def explain(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute SHAP values for all rows in df.
+
+        Steps:
+        1. Select + fillna SHAP_FEATURE_COLUMNS from df
+        2. shap_matrix = self.explainer.shap_values(X)
+           → shape: (n_rows, n_features)
+        3. Build result DataFrame:
+             columns = SHAP_FEATURE_COLUMNS
+             index   = df.index
+        4. Add column "total_cost_usd" from df for reference
+        5. Return DataFrame (one SHAP row per input row)
+        """
+
+    def load(self) -> bool:
+        """
+        Load saved model + explainer from registry.
+        Return True if both files exist and load successfully.
+        Return False otherwise (triggers retraining in engine).
+        """
+
+    def extract_top_drivers(
+        self, shap_row: pd.Series, n: int = 3
+    ) -> list:
+        """
+        Given a Series of feature→shap_value for one row,
+        return top N by absolute value as:
+        [{"feature": str, "value": float}, ...]
+        sorted descending by abs(value).
+        """
+
+══════════════════════════════════════════════════════════════════
+STEP 5 — REPOSITORY (DB READ/WRITE)
+══════════════════════════════════════════════════════════════════
+
+File: attribution/repository.py
+
+class AttributionRepository:
+
+    def get_features_for_group(
+        self,
+        cloud_provider: str,
+        service_category: str,
+        start_date: date,
+        end_date: date
+    ) -> List[Dict]:
+        """
+        SELECT feature_date AS usage_date,
+               account_id, environment, team,
+               total_cost_usd, record_count,
+               cost_lag_1d, cost_lag_7d, cost_lag_30d,
+               rolling_mean_7d, rolling_std_7d,
+               rolling_mean_30d, rolling_std_30d,
+               pct_change_1d, pct_change_7d, pct_change_30d,
+               z_score_30d,
+               day_of_week, day_of_month, week_of_year,
+               month, is_weekend, is_month_start, is_month_end
+        FROM spend_features
+        WHERE cloud_provider = %s
+          AND service_category = %s
+          AND feature_date BETWEEN %s AND %s
+        ORDER BY usage_date ASC
+        """
+
+    def get_all_groups(self) -> List[Dict]:
+        """
+        SELECT DISTINCT cloud_provider, service_category
+        FROM spend_features
+        ORDER BY cloud_provider, service_category
+        """
+
+    def upsert_attributions(
+        self, records: List[AttributionRecord]
+    ) -> int:
+        """
+        Bulk upsert into cost_attributions.
+        ON CONFLICT (attribution_date, cloud_provider,
+                     service_category, account_id,
+                     environment, team)
+        DO UPDATE SET shap_values=EXCLUDED.shap_values,
+                      top_driver_1=EXCLUDED.top_driver_1, ...
+                      computed_at=NOW()
+        Use execute_values() in batches of 500.
+        Serialize shap_values dict → json.dumps() before insert.
+        Returns rows upserted.
+        """
+
+    def get_attributions(
+        self,
+        start_date: date,
+        end_date: date,
+        cloud_provider: Optional[str] = None,
+        service_category: Optional[str] = None,
+        top_driver: Optional[str] = None
+    ) -> List[AttributionRecord]:
+        """
+        Query cost_attributions with optional filters.
+        If top_driver provided: WHERE top_driver_1 = %s
+                                   OR top_driver_2 = %s
+                                   OR top_driver_3 = %s
+        Returns List[AttributionRecord].
+        """
+
+══════════════════════════════════════════════════════════════════
+STEP 6 — ATTRIBUTION ENGINE (ORCHESTRATOR)
+══════════════════════════════════════════════════════════════════
+
+File: attribution/engine.py
+
+from pydantic import BaseModel
+
+class AttributionEngineResult(BaseModel):
+    groups_processed:   int
+    groups_skipped:     int
+    attributions_written: int
+    duration_seconds:   float
+    avg_r2_score:       float
+    errors:             List[str] = []
+
+class AttributionEngine:
+
+    def run(
+        self,
+        start_date: date,
+        end_date: date,
+        cloud_provider: Optional[str] = None,
+        force_retrain: bool = False
+    ) -> AttributionEngineResult:
+        """
+        For each (cloud × service_category) group:
+
+        1. repo.get_features_for_group(cloud, service, start, end)
+        2. If len(rows) < MIN_ROWS_FOR_TRAINING: skip, log
+        3. Load or train AttributionModel:
+             - model.load() → if False or force_retrain: model.fit(df)
+        4. model.explain(df) → shap_df
+        5. For each row in shap_df:
+             - Build AttributionRecord:
+                 attribution_date = row.usage_date
+                 shap_values      = {feat: shap_df[feat][i] for feat in SHAP_FEATURE_COLUMNS}
+                 top_driver_1/2/3 = model.extract_top_drivers(shap_row, n=3)
+                 model_r2_score   = model.r2_score_
+                 total_cost_usd   = row.total_cost_usd
+        6. repo.upsert_attributions(attribution_records)
+        7. Aggregate results into AttributionEngineResult
+
+        Error handling: try/except per group, log to result.errors,
+        continue to next group.
+
+        Print rich summary table:
+        | Cloud | Service   | Rows | R²    | Top Driver      |
+        | aws   | compute   | 365  | 0.87  | rolling_mean_7d |
+        | aws   | other     | 365  | 0.72  | cost_lag_1d     |
+        """
+
+══════════════════════════════════════════════════════════════════
+STEP 7 — CLI
+══════════════════════════════════════════════════════════════════
+
+File: attribution/main.py
+
+python attribution/main.py [OPTIONS]
+
+Options:
+  --start         YYYY-MM-DD   (required)
+  --end           YYYY-MM-DD   (required)
+  --cloud         aws|azure|gcp|all   (default: all)
+  --force-retrain              (ignore saved models)
+
+On completion print:
+  Groups processed:    N
+  Attributions written: N
+  Avg R² score:        0.XX
+  Duration:            XX.Xs
+  Errors:              N
+
+══════════════════════════════════════════════════════════════════
+FILE STRUCTURE
+══════════════════════════════════════════════════════════════════
+
+attribution/
+├── __init__.py
+├── requirements.txt
+├── config.py
+├── model.py
+├── engine.py
+├── repository.py
+├── main.py
+├── model_registry/         ← joblib files saved here
+├── init_db/
+│   └── attribution_schema.sql
+└── tests/
+    ├── __init__.py
+    ├── test_model.py
+    ├── test_engine.py
+    └── test_repository.py
+
+shared/schemas/
+└── attribution.py          ← NEW (add here only)
+
+══════════════════════════════════════════════════════════════════
+TESTS
+══════════════════════════════════════════════════════════════════
+
+─── test_model.py (NO DB required) ──────────────────────────────
+Setup: Build synthetic DataFrame — 120 rows, one group,
+       daily cost starting $100 + trend + noise, day 90 spikes 3×.
+       All SHAP_FEATURE_COLUMNS present (compute manually or fill 0).
+
+Test 1: fit() returns r2 > 0 and best_iteration < 500
+Test 2: Model + explainer files saved to model_registry/
+Test 3: explain() returns DataFrame with one row per input row
+        and one column per SHAP_FEATURE_COLUMNS
+Test 4: explain() — sum of SHAP values ≈ predicted value
+        (SHAP consistency property: sum(shap) + base_value ≈ f(x))
+Test 5: extract_top_drivers() returns exactly 3 items,
+        sorted by abs(value) descending
+Test 6: load() returns True after fit() has saved model
+
+─── test_repository.py (REQUIRES TIMESCALEDB 127.0.0.1:5433) ───
+Test 1: get_all_groups() returns > 0 rows
+Test 2: get_features_for_group("aws","other",2023-01,2023-12)
+        returns rows with required columns
+Test 3: upsert_attributions() inserts and ON CONFLICT updates
+Test 4: get_attributions() date range filter works
+Test 5: get_attributions(top_driver="cost_lag_1d") filters correctly
+
+─── test_engine.py (REQUIRES TIMESCALEDB 127.0.0.1:5433) ────────
+Test 1: engine.run(aws, 2023-01-01, 2023-03-31)
+        → result.attributions_written > 0
+        → result.avg_r2_score > 0
+        → result.errors == []
+Test 2: Groups with < 45 rows are in result.groups_skipped
+Test 3: force_retrain=True retrains even if model file exists
+Test 4: After run, get_attributions() returns rows in date range
+
+══════════════════════════════════════════════════════════════════
+attribution/requirements.txt
+══════════════════════════════════════════════════════════════════
+lightgbm>=4.1.0
+shap>=0.44.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
+numpy>=1.26.0
+psycopg2-binary>=2.9.9
+joblib>=1.3.0
+pydantic>=2.0.0
+rich>=13.0.0
+click>=8.1.0
+python-dotenv>=1.0.0
+
+══════════════════════════════════════════════════════════════════
+VALIDATION CHECKLIST
+══════════════════════════════════════════════════════════════════
+
+[ ] attribution_schema.sql executed — cost_attributions hypertable exists
+[ ] shared/schemas/attribution.py — AttributionRecord defined
+[ ] attribution/config.py — SHAP_FEATURE_COLUMNS list (19 features)
+[ ] attribution/model.py — fit(), explain(), load(),
+    extract_top_drivers() all implemented
+[ ] attribution/repository.py — 4 methods, uses DatabaseManager
+    from storage.db, uses feature_date AS usage_date alias
+[ ] attribution/engine.py — per-group try/except, skips < 45 rows,
+    rich summary table
+[ ] attribution/main.py — CLI with --force-retrain flag
+[ ] model_registry/ — .joblib files present after run
+[ ] All 3 test files passing
+
+[ ] CLI validation:
+    python attribution/main.py --start 2023-01-01 --end 2023-12-31
+
+    Expected:
+    Groups processed:     ~5–15 (groups with ≥ 45 rows)
+    Attributions written: ~1,500–5,000
+    Avg R² score:         > 0.60
+    Errors:               0
+
+[ ] Top driver sanity: for aws/other group, top_driver_1 should be
+    a lag or rolling feature (cost_lag_1d, rolling_mean_7d, etc.)
+    NOT a calendar feature — calendar features have low SHAP on
+    cost data unless there's strong weekly seasonality.
+
+[ ] shared/schemas/billing.py, normalized.py, anomaly.py — UNTOUCHED
+[ ] detection/, forecasting/, storage/, normalization/,
+    ingestion/ — UNTOUCHED
+
+══════════════════════════════════════════════════════════════════
+DO NOT IMPLEMENT YET
+══════════════════════════════════════════════════════════════════
+- No FastAPI endpoints (Module 9)
+- No alerting (Module 10)
+- No frontend (Module 11)
+- No real-time streaming
+
+══════════════════════════════════════════════════════════════════
+REPORT BACK AFTER RUNNING
+══════════════════════════════════════════════════════════════════
+1. CLI output — groups_processed, attributions_written,
+   avg_r2, duration, errors
+2. Top 3 drivers for aws/other group — which features dominated?
+3. R² scores — min, max, avg across all groups
+4. Attributions row count: SELECT COUNT(*) FROM cost_attributions;
+5. Test results — pass/fail for all 3 files
+6. Any deviations from schema or file structure
+
+Waiting for your summary before generating Prompt 9 (FastAPI Backend).
+
+PROMPT-9:
+╔══════════════════════════════════════════════════════════════════╗
+║        PROMPT 9: FastAPI Backend                                 ║
+║        Cloud FinOps Intelligence Platform                        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+OBJECTIVE
+─────────
+Build the complete FastAPI backend that serves all data from Modules
+1–8 (normalized billing, anomalies, forecasts, attributions) via a
+clean REST API. This is the single integration layer consumed by
+Module 10 (React dashboard) and Module 11 (Alerting system).
+
+Every response schema defined here is LOCKED — the frontend will
+depend on them exactly. Design them carefully.
+
+Module lives at: api/
+
+LOCKED CONTRACTS — DO NOT MODIFY
+─────────────────────────────────
+- shared/schemas/billing.py       — BillingRecord
+- shared/schemas/normalized.py    — NormalizedRecord
+- shared/schemas/anomaly.py       — AnomalyResult
+- shared/schemas/forecast.py      — ForecastResult
+- shared/schemas/attribution.py   — AttributionRecord
+- storage/db.py                   — DatabaseManager
+- TimescaleDB: host=127.0.0.1, port=5433, db=finops,
+  user=finops_user, password=finops_pass
+- detection/, forecasting/, attribution/ — UNTOUCHED
+- cost_attributions: computed_at is DB-managed — never pass it
+  in upsert payloads (carry-forward from Module 8 deviation)
+
+══════════════════════════════════════════════════════════════════
+STEP 1 — PROJECT STRUCTURE
+══════════════════════════════════════════════════════════════════
+
+api/
+├── __init__.py
+├── requirements.txt
+├── main.py                  ← FastAPI app + CORS + router mounting
+├── dependencies.py          ← DB session injection, pagination params
+├── config.py                ← env-loaded settings (port, DB URL, etc.)
+├── routers/
+│   ├── __init__.py
+│   ├── billing.py           ← /billing/* endpoints
+│   ├── anomalies.py         ← /anomalies/* endpoints
+│   ├── forecasts.py         ← /forecasts/* endpoints
+│   ├── attribution.py       ← /attribution/* endpoints
+│   └── health.py            ← /health, /ready endpoints
+├── schemas/
+│   ├── __init__.py
+│   ├── requests.py          ← Pydantic request models (query filters)
+│   └── responses.py         ← Pydantic response envelopes
+└── tests/
+    ├── __init__.py
+    ├── conftest.py
+    ├── test_billing.py
+    ├── test_anomalies.py
+    ├── test_forecasts.py
+    └── test_attribution.py
+
+══════════════════════════════════════════════════════════════════
+STEP 2 — RESPONSE ENVELOPE (LOCKED — USED BY ALL ENDPOINTS)
+══════════════════════════════════════════════════════════════════
+
+File: api/schemas/responses.py
+
+Every list endpoint returns this envelope — no exceptions:
+
+from pydantic import BaseModel
+from typing import Generic, List, Optional, TypeVar
+from datetime import datetime
+
+T = TypeVar("T")
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    data:        List[T]
+    total:       int          # total matching rows (pre-pagination)
+    page:        int
+    page_size:   int
+    has_next:    bool
+
+class ErrorResponse(BaseModel):
+    error:       str
+    detail:      Optional[str] = None
+    timestamp:   datetime
+
+class HealthResponse(BaseModel):
+    status:      str          # "ok" | "degraded" | "down"
+    version:     str
+    db_connected: bool
+    uptime_seconds: float
+
+─── Billing-specific response ────────────────────────────────────
+
+class BillingSummary(BaseModel):
+    """Aggregated daily spend — NOT raw records (too large)"""
+    usage_date:       str           # "YYYY-MM-DD"
+    cloud_provider:   str
+    service:          str
+    region:           Optional[str]
+    total_cost_usd:   float
+    record_count:     int
+    anomaly_count:    int
+
+class SpendByDimension(BaseModel):
+    """For /billing/by-cloud, /billing/by-service responses"""
+    dimension:        str           # cloud name, service name, etc.
+    total_cost_usd:   float
+    pct_of_total:     float
+    record_count:     int
+
+─── Anomaly-specific responses ───────────────────────────────────
+
+class AnomalyListItem(BaseModel):
+    """Lightweight anomaly record for list views"""
+    anomaly_id:       str
+    record_id:        str
+    detection_method: str
+    severity:         str
+    z_score:          Optional[float]
+    expected_cost:    float
+    actual_cost:      float
+    deviation_pct:    float
+    detected_at:      str
+    # Denormalized from billing join:
+    cloud_provider:   str
+    service:          str
+    region:           Optional[str]
+    usage_date:       str
+
+class AnomalySummary(BaseModel):
+    """For /anomalies/summary endpoint"""
+    total_anomalies:  int
+    by_severity:      dict   # {"low": N, "medium": N, "high": N, "critical": N}
+    by_cloud:         dict   # {"aws": N, "azure": N, "gcp": N}
+    by_type:          dict   # {"point_spike": N, ...}
+    date_range:       dict   # {"start": "...", "end": "..."}
+
+─── Forecast-specific responses ──────────────────────────────────
+
+class ForecastListItem(BaseModel):
+    forecast_id:      str
+    cloud_provider:   str
+    service:          str
+    region:           Optional[str]
+    horizon_days:     int
+    forecast_date:    str
+    predicted_cost:   float
+    lower_bound:      float
+    upper_bound:      float
+    model_used:       str
+    generated_at:     str
+
+─── Attribution-specific responses ───────────────────────────────
+
+class AttributionListItem(BaseModel):
+    attribution_date: str
+    cloud_provider:   str
+    service_category: str
+    account_id:       str
+    environment:      str
+    team:             str
+    total_cost_usd:   float
+    top_driver_1:     Optional[str]
+    top_driver_1_value: Optional[float]
+    top_driver_2:     Optional[str]
+    top_driver_2_value: Optional[float]
+    top_driver_3:     Optional[str]
+    top_driver_3_value: Optional[float]
+    model_r2_score:   Optional[float]
+    shap_values:      dict
+
+══════════════════════════════════════════════════════════════════
+STEP 3 — DEPENDENCIES
+══════════════════════════════════════════════════════════════════
+
+File: api/dependencies.py
+
+from fastapi import Depends, Query
+from storage.db import DatabaseManager
+
+_db: DatabaseManager = None
+
+def get_db() -> DatabaseManager:
+    """
+    Returns a module-level singleton DatabaseManager.
+    Initialized once on first call using DB settings from config.py.
+    Used via FastAPI Depends() injection.
+    """
+
+class PaginationParams:
+    """
+    Reusable pagination — inject with Depends(PaginationParams).
+    Defaults: page=1, page_size=50, max page_size=500.
+    """
+    def __init__(
+        self,
+        page:      int = Query(default=1, ge=1),
+        page_size: int = Query(default=50, ge=1, le=500)
+    ):
+        self.page      = page
+        self.page_size = page_size
+        self.offset    = (page - 1) * page_size
+
+══════════════════════════════════════════════════════════════════
+STEP 4 — ROUTER: HEALTH
+══════════════════════════════════════════════════════════════════
+
+File: api/routers/health.py
+
+GET /health
+  Response: HealthResponse
+  Logic:
+    - Try a SELECT 1 against TimescaleDB
+    - db_connected = True if query succeeds, False otherwise
+    - status = "ok" if db_connected else "degraded"
+    - version pulled from api/config.py (APP_VERSION = "0.1.0")
+    - uptime_seconds = time since app startup
+
+GET /ready
+  Response: {"ready": true} | HTTP 503
+  Logic: returns 200 only if DB is reachable
+
+══════════════════════════════════════════════════════════════════
+STEP 5 — ROUTER: BILLING
+══════════════════════════════════════════════════════════════════
+
+File: api/routers/billing.py
+
+All billing queries run against: normalized_records table
+(written by Module 3, read by Modules 5–8, now served here)
+
+─────────────────────────────────────────────────────────────────
+GET /billing/summary
+─────────────────────────────────────────────────────────────────
+Query params:
+  start_date:     YYYY-MM-DD (required)
+  end_date:       YYYY-MM-DD (required)
+  cloud_provider: aws|azure|gcp (optional, repeatable)
+  service:        str (optional)
+  region:         str (optional)
+  + PaginationParams
+
+Response: PaginatedResponse[BillingSummary]
+
+SQL (approximate — implement as parameterized query):
+  SELECT
+    usage_date::text,
+    cloud_provider,
+    service,
+    region,
+    SUM(cost_usd)         AS total_cost_usd,
+    COUNT(*)              AS record_count,
+    SUM(is_anomaly::int)  AS anomaly_count
+  FROM normalized_records
+  WHERE usage_date BETWEEN :start AND :end
+    AND (:cloud IS NULL OR cloud_provider = ANY(:cloud))
+    AND (:service IS NULL OR service = :service)
+    AND (:region IS NULL OR region = :region)
+  GROUP BY usage_date, cloud_provider, service, region
+  ORDER BY usage_date DESC
+  LIMIT :limit OFFSET :offset
+
+─────────────────────────────────────────────────────────────────
+GET /billing/by-cloud
+─────────────────────────────────────────────────────────────────
+Query params: start_date, end_date (required)
+Response: List[SpendByDimension]  (not paginated — max 3 items)
+
+Returns total spend per cloud provider in range,
+with pct_of_total = provider_spend / grand_total * 100.
+
+─────────────────────────────────────────────────────────────────
+GET /billing/by-service
+─────────────────────────────────────────────────────────────────
+Query params: start_date, end_date, cloud_provider (optional),
+              top_n: int = 10
+Response: List[SpendByDimension]  (top N services by cost)
+
+─────────────────────────────────────────────────────────────────
+GET /billing/trend
+─────────────────────────────────────────────────────────────────
+Query params:
+  start_date, end_date (required)
+  cloud_provider (optional)
+  granularity: "day" | "week" | "month" (default: "day")
+
+Response: List[{"period": str, "total_cost_usd": float,
+                "record_count": int}]
+
+SQL grouping:
+  - day:   DATE_TRUNC('day', usage_date)
+  - week:  DATE_TRUNC('week', usage_date)
+  - month: DATE_TRUNC('month', usage_date)
+Ordered ASC by period.
+
+══════════════════════════════════════════════════════════════════
+STEP 6 — ROUTER: ANOMALIES
+══════════════════════════════════════════════════════════════════
+
+File: api/routers/anomalies.py
+
+Table: anomaly_results (written by Module 6, joined with
+normalized_records for billing context)
+
+─────────────────────────────────────────────────────────────────
+GET /anomalies
+─────────────────────────────────────────────────────────────────
+Query params:
+  start_date, end_date (required)
+  cloud_provider (optional, repeatable)
+  severity: low|medium|high|critical (optional, repeatable)
+  detection_method: zscore|isolation_forest|lstm (optional)
+  service (optional)
+  + PaginationParams
+
+Response: PaginatedResponse[AnomalyListItem]
+
+JOIN anomaly_results ar
+  ON normalized_records nr USING (record_id)
+to populate cloud_provider, service, region, usage_date
+in each AnomalyListItem.
+
+ORDER BY ar.detected_at DESC
+
+─────────────────────────────────────────────────────────────────
+GET /anomalies/{anomaly_id}
+─────────────────────────────────────────────────────────────────
+Response: AnomalyListItem | HTTP 404
+
+─────────────────────────────────────────────────────────────────
+GET /anomalies/summary
+─────────────────────────────────────────────────────────────────
+Query params: start_date, end_date
+Response: AnomalySummary
+
+Runs 3 GROUP BY queries:
+  1. GROUP BY severity → by_severity dict
+  2. GROUP BY cloud_provider → by_cloud dict
+  3. GROUP BY anomaly_type (from normalized_records) → by_type dict
+     NOTE: anomaly_type lives in normalized_records, not anomaly_results.
+     Join required.
+
+─────────────────────────────────────────────────────────────────
+GET /anomalies/recent
+─────────────────────────────────────────────────────────────────
+Query params: limit: int = 10 (max 50)
+Response: List[AnomalyListItem]
+Returns the N most recent anomalies (by detected_at DESC) — no
+date filter. Used by dashboard "Latest Alerts" widget.
+
+══════════════════════════════════════════════════════════════════
+STEP 7 — ROUTER: FORECASTS
+══════════════════════════════════════════════════════════════════
+
+File: api/routers/forecasts.py
+
+Table: forecast_results (written by Module 7)
+
+─────────────────────────────────────────────────────────────────
+GET /forecasts
+─────────────────────────────────────────────────────────────────
+Query params:
+  cloud_provider (optional, repeatable)
+  service (optional)
+  horizon_days: 7|14|30|90 (optional)
+  model_used: prophet|lightgbm|ensemble (optional)
+  start_date, end_date (forecast_date range, optional)
+  + PaginationParams
+
+Response: PaginatedResponse[ForecastListItem]
+ORDER BY forecast_date ASC
+
+─────────────────────────────────────────────────────────────────
+GET /forecasts/latest
+─────────────────────────────────────────────────────────────────
+Query params:
+  cloud_provider (required)
+  service (required)
+  horizon_days: int (default: 30)
+
+Response: List[ForecastListItem]
+
+Returns the most recently generated forecast for the given
+(cloud × service × horizon) combination — the full date series
+from the latest run. Identified by MAX(generated_at).
+
+─────────────────────────────────────────────────────────────────
+GET /forecasts/budget-risk
+─────────────────────────────────────────────────────────────────
+Query params:
+  cloud_provider (required)
+  monthly_budget_usd: float (required)
+  horizon_days: int (default: 30)
+
+Response:
+{
+  "cloud_provider":    str,
+  "monthly_budget":    float,
+  "predicted_total":   float,
+  "lower_total":       float,
+  "upper_total":       float,
+  "breach_risk":       "none"|"possible"|"likely"|"certain",
+  "breach_date":       str | null,   # first date upper_bound exceeds budget
+  "days_to_breach":    int | null
+}
+
+Logic:
+  breach_risk =
+    "none"     if upper_total < monthly_budget
+    "possible" if lower_total < monthly_budget <= predicted_total
+    "likely"   if predicted_total < monthly_budget <= upper_total
+    "certain"  if lower_total >= monthly_budget
+  breach_date = first forecast_date where cumulative upper_bound
+                crosses monthly_budget_usd
+
+══════════════════════════════════════════════════════════════════
+STEP 8 — ROUTER: ATTRIBUTION
+══════════════════════════════════════════════════════════════════
+
+File: api/routers/attribution.py
+
+Table: cost_attributions (written by Module 8)
+IMPORTANT: computed_at is DB-managed — never upsert it from API.
+
+─────────────────────────────────────────────────────────────────
+GET /attribution
+─────────────────────────────────────────────────────────────────
+Query params:
+  start_date, end_date (required)
+  cloud_provider (optional)
+  service_category (optional)
+  top_driver: str (optional — filter by top_driver_1 = value)
+  + PaginationParams
+
+Response: PaginatedResponse[AttributionListItem]
+ORDER BY attribution_date DESC
+
+─────────────────────────────────────────────────────────────────
+GET /attribution/top-drivers
+─────────────────────────────────────────────────────────────────
+Query params:
+  start_date, end_date (required)
+  cloud_provider (optional)
+  top_n: int = 10
+
+Response: List[{"driver": str, "avg_shap_value": float,
+                "appearance_count": int}]
+
+Logic: Aggregate top_driver_1, top_driver_2, top_driver_3 columns
+across all rows in date range. Count appearances and average their
+respective _value columns. Sort by avg_shap_value DESC.
+
+─────────────────────────────────────────────────────────────────
+GET /attribution/{cloud_provider}/{service_category}
+─────────────────────────────────────────────────────────────────
+Query params: start_date, end_date
+Response: List[AttributionListItem]
+
+Returns full daily attribution time series for a specific
+(cloud × service) group — used by dashboard detail views.
+
+══════════════════════════════════════════════════════════════════
+STEP 9 — MAIN APP
+══════════════════════════════════════════════════════════════════
+
+File: api/main.py
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import time
+
+APP_START_TIME = time.time()
+
+app = FastAPI(
+    title="Cloud FinOps Intelligence API",
+    version="0.1.0",
+    description="AI-Powered Multi-Cloud Cost Anomaly Detection & Forecasting",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # React dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount all routers with prefixes:
+app.include_router(health_router,      prefix="",            tags=["Health"])
+app.include_router(billing_router,     prefix="/billing",    tags=["Billing"])
+app.include_router(anomaly_router,     prefix="/anomalies",  tags=["Anomalies"])
+app.include_router(forecast_router,    prefix="/forecasts",  tags=["Forecasts"])
+app.include_router(attribution_router, prefix="/attribution",tags=["Attribution"])
+
+Startup event:
+@app.on_event("startup")
+async def startup():
+    # Initialize DB singleton via dependencies.get_db()
+    # Log: "FinOps API started. DB connected: True/False"
+
+══════════════════════════════════════════════════════════════════
+STEP 10 — CONFIG
+══════════════════════════════════════════════════════════════════
+
+File: api/config.py
+
+Load all settings from environment variables with fallbacks:
+
+DB_HOST     = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT     = int(os.getenv("DB_PORT", "5433"))
+DB_NAME     = os.getenv("DB_NAME", "finops")
+DB_USER     = os.getenv("DB_USER", "finops_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "finops_pass")
+APP_VERSION = "0.1.0"
+API_HOST    = os.getenv("API_HOST", "0.0.0.0")
+API_PORT    = int(os.getenv("API_PORT", "8000"))
+LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO")
+
+══════════════════════════════════════════════════════════════════
+STEP 11 — TESTS
+══════════════════════════════════════════════════════════════════
+
+File: api/tests/conftest.py
+─────────────────────────────────────────────────────────────────
+Use FastAPI's TestClient (from starlette.testclient import TestClient).
+Create a module-level client fixture:
+  client = TestClient(app)
+All tests use this client — no mocking of DB (use real TimescaleDB
+at 127.0.0.1:5433).
+
+─── test_billing.py ─────────────────────────────────────────────
+Test 1: GET /billing/summary?start_date=2023-01-01&end_date=2023-03-31
+        → status 200, response has "data", "total", "page" keys
+        → data[0] has "total_cost_usd", "record_count", "anomaly_count"
+
+Test 2: GET /billing/by-cloud?start_date=2023-01-01&end_date=2023-12-31
+        → 3 items (aws, azure, gcp)
+        → sum of pct_of_total ≈ 100 (within 0.1 tolerance)
+
+Test 3: GET /billing/by-service?start_date=2023-01-01&end_date=2023-12-31&top_n=5
+        → len(data) <= 5
+
+Test 4: GET /billing/trend?start_date=2023-01-01&end_date=2023-03-31&granularity=month
+        → 3 periods returned (Jan, Feb, Mar)
+        → each has "period", "total_cost_usd"
+
+Test 5: Invalid date range (end < start) → HTTP 422
+
+─── test_anomalies.py ───────────────────────────────────────────
+Test 1: GET /anomalies?start_date=2023-01-01&end_date=2023-12-31
+        → status 200, total > 0
+        → each item has cloud_provider, service, severity
+
+Test 2: GET /anomalies?severity=critical → all items have severity="critical"
+
+Test 3: GET /anomalies/summary?start_date=2023-01-01&end_date=2023-12-31
+        → by_cloud has "aws", "azure", "gcp" keys
+        → by_severity has all 4 severity keys
+
+Test 4: GET /anomalies/recent?limit=5 → exactly 5 items (or fewer if DB has less)
+
+Test 5: GET /anomalies/nonexistent-id → HTTP 404
+
+─── test_forecasts.py ───────────────────────────────────────────
+Test 1: GET /forecasts?cloud_provider=aws&horizon_days=30
+        → status 200, all items have horizon_days=30
+
+Test 2: GET /forecasts/latest?cloud_provider=aws&service=EC2&horizon_days=30
+        → all items share the same generated_at (latest run)
+        → items ordered by forecast_date ASC
+
+Test 3: GET /forecasts/budget-risk?cloud_provider=aws&monthly_budget_usd=180000
+        → response has "breach_risk" in ["none","possible","likely","certain"]
+        → if breach_risk != "none": breach_date is not null
+
+─── test_attribution.py ─────────────────────────────────────────
+Test 1: GET /attribution?start_date=2023-01-01&end_date=2023-12-31
+        → status 200, total > 0
+        → each item has top_driver_1 and shap_values dict
+
+Test 2: GET /attribution/top-drivers?start_date=2023-01-01&end_date=2023-12-31
+        → list of drivers, each has "driver", "avg_shap_value",
+          "appearance_count"
+        → top driver should be a lag/rolling feature (not calendar)
+          given synthetic data characteristics
+
+Test 3: GET /attribution/aws/other?start_date=2023-01-01&end_date=2023-12-31
+        → all items have cloud_provider="aws", service_category="other"
+
+══════════════════════════════════════════════════════════════════
+api/requirements.txt
+══════════════════════════════════════════════════════════════════
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+starlette>=0.36.0
+httpx>=0.27.0         # TestClient dependency
+rich>=13.0.0
+
+══════════════════════════════════════════════════════════════════
+VALIDATION CHECKLIST
+══════════════════════════════════════════════════════════════════
+
+[ ] api/main.py — FastAPI app with CORS, 5 routers mounted
+[ ] api/dependencies.py — get_db() singleton + PaginationParams
+[ ] api/schemas/responses.py — all response models defined
+[ ] api/routers/health.py — /health + /ready endpoints
+[ ] api/routers/billing.py — /summary, /by-cloud, /by-service, /trend
+[ ] api/routers/anomalies.py — list, detail, /summary, /recent
+[ ] api/routers/forecasts.py — list, /latest, /budget-risk
+[ ] api/routers/attribution.py — list, /top-drivers, /{cloud}/{service}
+[ ] All endpoints return PaginatedResponse envelope for lists
+[ ] /health confirms DB connectivity
+[ ] /forecasts/budget-risk returns correct breach_risk logic
+[ ] All 4 test files passing (16+ tests total)
+
+[ ] Server start validation:
+    uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    → Swagger UI accessible at http://localhost:8000/docs
+    → GET /health → {"status": "ok", "db_connected": true}
+
+[ ] shared/schemas/billing.py, normalized.py, anomaly.py,
+    forecast.py, attribution.py — UNTOUCHED
+[ ] detection/, forecasting/, attribution/, storage/,
+    normalization/, ingestion/ — UNTOUCHED
+
+══════════════════════════════════════════════════════════════════
+DO NOT IMPLEMENT YET
+══════════════════════════════════════════════════════════════════
+- No WebSocket endpoints (real-time streaming — Module 10)
+- No authentication/JWT (add in Module 12)
+- No rate limiting
+- No frontend (Module 10)
+- No alerting triggers (Module 11)
+
+══════════════════════════════════════════════════════════════════
+REPORT BACK AFTER RUNNING
+══════════════════════════════════════════════════════════════════
+1. Swagger UI — does /docs load cleanly with all 5 router groups?
+2. GET /health — db_connected true or false?
+3. GET /anomalies/summary (2023 full year) — what are the by_cloud
+   and by_severity counts?
+4. GET /forecasts/budget-risk for aws at $180,000 — what breach_risk
+   level does it return?
+5. GET /attribution/top-drivers (2023) — what is the #1 driver?
+   (Should match Module 8's finding: rolling_mean_30d)
+6. All 4 test files — pass/fail counts
+7. Any deviations from schema, router structure, or response format
+   (these are CRITICAL to document — Module 10 depends on them exactly)
+══════════════════════════════════════════════════════════════════
+
+PROMPT-10:
+╔══════════════════════════════════════════════════════════════════╗
+║        PROMPT 10: React Frontend Dashboard                       ║
+║        Cloud FinOps Intelligence Platform                        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+OBJECTIVE
+─────────
+Build the complete React dashboard that consumes the FastAPI backend
+(Module 9) and provides a FinOps team with a professional, minimal,
+dark-mode interface for spend monitoring, anomaly detection, and
+forecasting.
+
+Module lives at: frontend/  (Vite + React scaffold from Module 1)
+
+DESIGN PHILOSOPHY — READ CAREFULLY
+────────────────────────────────────
+Inspired by: Linear, Vercel Dashboard, Planetscale, Raycast.
+NOT a generic AI-generated dashboard — no default Recharts colors,
+no Bootstrap cards, no rainbow status badges.
+
+COLOR TOKENS (use CSS variables — define in frontend/src/styles/tokens.css):
+  --bg-base:       #0A0A0F   ← page background
+  --bg-surface:    #13131A   ← card / panel background
+  --bg-elevated:   #1C1C27   ← hover states, nested surfaces
+  --border:        #2A2A3D   ← all borders and dividers
+  --text-primary:  #E8E8F0   ← headings, values
+  --text-secondary:#7B7B96   ← labels, metadata, axis text
+  --accent:        #F59E0B   ← single accent — CTAs, active nav, anomaly highlights
+  --accent-dim:    #F59E0B30 ← 18% opacity amber — low severity, hover fills
+  --accent-med:    #F59E0B70 ← 44% opacity amber — medium severity
+  --accent-full:   #F59E0B   ← full amber — critical, active state
+  --green:         #4ADE80   ← cost decrease indicator ONLY
+  --red:           #F87171   ← cost increase indicator ONLY
+  (red/green used ONLY for delta arrows — never for status badges)
+
+TYPOGRAPHY:
+  Font: Inter (import from Google Fonts in index.html)
+  All cost/number figures: font-variant-numeric: tabular-nums
+  No font sizes below 11px
+
+API BASE URL: http://localhost:8000  (hardcode for dev — env var later)
+
+LOCKED API CONTRACTS (DO NOT DEVIATE)
+───────────────────────────────────────
+All responses follow PaginatedResponse envelope:
+  { data: [...], total: int, page: int, page_size: int, has_next: bool }
+
+Endpoints consumed:
+  GET /billing/summary?start_date&end_date&cloud_provider&page&page_size
+  GET /billing/by-cloud?start_date&end_date
+  GET /billing/by-service?start_date&end_date&top_n=10
+  GET /billing/trend?start_date&end_date&granularity=day|week|month
+  GET /anomalies?start_date&end_date&severity&cloud_provider&page&page_size
+  GET /anomalies/summary?start_date&end_date
+  GET /anomalies/recent?limit=5
+  GET /forecasts?cloud_provider&horizon_days&page&page_size
+  GET /forecasts/latest?cloud_provider&horizon_days
+  GET /forecasts/budget-risk?cloud_provider&monthly_budget_usd
+  GET /attribution/top-drivers?start_date&end_date
+  GET /attribution/{cloud}/{service}?start_date&end_date
+  GET /health
+
+Anomaly detail lookup: use anomaly_id (NOT record_id — Module 9 deviation)
+
+══════════════════════════════════════════════════════════════════
+STEP 1 — PROJECT STRUCTURE
+══════════════════════════════════════════════════════════════════
+
+frontend/
+├── index.html
+├── vite.config.ts
+├── package.json
+├── src/
+│   ├── main.tsx
+│   ├── App.tsx
+│   ├── styles/
+│   │   ├── tokens.css          ← CSS custom properties (all colors above)
+│   │   └── global.css          ← reset, body bg, scrollbar, Inter font
+│   ├── api/
+│   │   ├── client.ts           ← base fetch wrapper with error handling
+│   │   ├── billing.ts          ← all /billing/* calls
+│   │   ├── anomalies.ts        ← all /anomalies/* calls
+│   │   ├── forecasts.ts        ← all /forecasts/* calls
+│   │   └── attribution.ts      ← all /attribution/* calls
+│   ├── types/
+│   │   └── index.ts            ← TypeScript types matching API responses
+│   ├── hooks/
+│   │   ├── useBilling.ts
+│   │   ├── useAnomalies.ts
+│   │   ├── useForecasts.ts
+│   │   └── useAttribution.ts
+│   ├── components/
+│   │   ├── layout/
+│   │   │   ├── Sidebar.tsx
+│   │   │   ├── TopBar.tsx
+│   │   │   └── PageWrapper.tsx
+│   │   ├── shared/
+│   │   │   ├── MetricCard.tsx      ← single KPI tile
+│   │   │   ├── DataTable.tsx       ← reusable paginated table
+│   │   │   ├── DateRangePicker.tsx ← start/end date inputs
+│   │   │   ├── CloudFilter.tsx     ← aws|azure|gcp|all pill selector
+│   │   │   ├── Skeleton.tsx        ← loading placeholder
+│   │   │   ├── EmptyState.tsx
+│   │   │   └── SeverityBadge.tsx   ← amber opacity variants, no colors
+│   │   ├── charts/
+│   │   │   ├── SpendTrendChart.tsx     ← Recharts AreaChart
+│   │   │   ├── SpendByCloudChart.tsx   ← Recharts custom BarChart
+│   │   │   ├── ForecastChart.tsx       ← Recharts ComposedChart
+│   │   │   └── ShapDriversChart.tsx    ← horizontal bar chart
+│   │   └── anomalies/
+│   │       ├── AnomalyList.tsx
+│   │       └── AnomalyDrawer.tsx    ← slide-in detail panel
+│   └── pages/
+│       ├── OverviewPage.tsx
+│       ├── AnomaliesPage.tsx
+│       ├── ForecastPage.tsx
+│       └── AttributionPage.tsx
+
+══════════════════════════════════════════════════════════════════
+STEP 2 — LAYOUT
+══════════════════════════════════════════════════════════════════
+
+File: src/components/layout/Sidebar.tsx
+
+Fixed left sidebar, 220px wide.
+Background: var(--bg-surface)
+Right border: 1px solid var(--border)
+No shadow — border does the separation.
+
+Navigation items (with Lucide React icons):
+  LayoutDashboard  → "Overview"    → /
+  AlertTriangle    → "Anomalies"   → /anomalies
+  TrendingUp       → "Forecasts"   → /forecasts
+  PieChart         → "Attribution" → /attribution
+
+Active item style:
+  Background: var(--accent-dim)
+  Left border: 2px solid var(--accent)
+  Text color: var(--accent)
+  (No filled buttons — just these three properties)
+
+Bottom of sidebar:
+  API health dot — green (#4ADE80) if /health returns ok,
+  amber if degraded, dim gray if down. 6px circle, no label.
+
+File: src/components/layout/TopBar.tsx
+
+Height: 52px, border-bottom: 1px solid var(--border)
+Background: var(--bg-base) (not surface — flush with page)
+Left: page title (dynamic, from route)
+Right: DateRangePicker + CloudFilter components
+       (shared global filters — passed down via context)
+
+File: src/components/layout/PageWrapper.tsx
+
+Wraps page content. padding: 24px. Max-width: none (full width).
+
+══════════════════════════════════════════════════════════════════
+STEP 3 — GLOBAL STATE (React Context)
+══════════════════════════════════════════════════════════════════
+
+File: src/context/FilterContext.tsx
+
+Single context for global date range + cloud filter:
+
+interface FilterState {
+  startDate: string     // "YYYY-MM-DD"
+  endDate:   string     // "YYYY-MM-DD"
+  cloud:     "all" | "aws" | "azure" | "gcp"
+}
+
+Default:
+  startDate = 90 days ago (UTC)
+  endDate   = yesterday (UTC)
+  cloud     = "all"
+
+TopBar reads/writes this context.
+All pages read from this context — no prop drilling.
+
+══════════════════════════════════════════════════════════════════
+STEP 4 — API CLIENT LAYER
+══════════════════════════════════════════════════════════════════
+
+File: src/api/client.ts
+
+const BASE_URL = "http://localhost:8000"
+
+async function apiFetch<T>(
+  path: string,
+  params?: Record<string, string | number | undefined>
+): Promise<T>
+  - Builds URL with URLSearchParams (skip undefined values)
+  - On non-2xx: throws { status, message } object
+  - No auth headers (Module 12)
+
+File: src/types/index.ts
+
+Define TypeScript interfaces matching EVERY API response shape:
+
+interface PaginatedResponse<T> {
+  data: T[]
+  total: number
+  page: number
+  page_size: number
+  has_next: boolean
+}
+
+interface BillingSummary {
+  usage_date: string
+  cloud_provider: string
+  service: string
+  total_cost_usd: number
+  record_count: number
+  anomaly_count: number
+}
+
+interface SpendByDimension {
+  dimension: string
+  total_cost_usd: number
+  pct_of_total: number
+  record_count: number
+}
+
+interface TrendPoint {
+  period: string
+  total_cost_usd: number
+  record_count: number
+}
+
+interface AnomalyListItem {
+  anomaly_id: string      ← use this for detail lookup (NOT record_id)
+  detection_method: string
+  severity: string
+  z_score: number | null
+  expected_cost: number
+  actual_cost: number
+  deviation_pct: number
+  detected_at: string
+  cloud_provider: string
+  service: string
+  usage_date: string
+}
+
+interface AnomalySummary {
+  total_anomalies: number
+  by_severity: Record<string, number>
+  by_cloud: Record<string, number>
+  by_type: Record<string, number>
+}
+
+interface ForecastItem {
+  forecast_id: string
+  cloud_provider: string
+  service: string
+  horizon_days: number
+  forecast_date: string
+  predicted_cost: number
+  lower_bound: number
+  upper_bound: number
+  model_used: string
+}
+
+interface BudgetRisk {
+  breach_risk: "none" | "possible" | "likely" | "certain"
+  breach_date: string | null
+  projected_monthly_cost: number
+  monthly_budget_usd: number
+  confidence_pct: number
+}
+
+interface TopDriver {
+  driver: string
+  avg_shap_value: number
+  appearance_count: number
+}
+
+interface AttributionItem {
+  attribution_date: string
+  cloud_provider: string
+  service_category: string
+  total_cost_usd: number
+  shap_values: Record<string, number>
+  top_driver_1: string
+  top_driver_1_value: number
+  top_driver_2: string | null
+  top_driver_2_value: number | null
+  top_driver_3: string | null
+  top_driver_3_value: number | null
+}
+
+══════════════════════════════════════════════════════════════════
+STEP 5 — SHARED COMPONENTS
+══════════════════════════════════════════════════════════════════
+
+─── MetricCard.tsx ──────────────────────────────────────────────
+Props: { label: string, value: string, delta?: number, 
+         deltaLabel?: string, loading?: boolean }
+
+Layout: padding 20px, background var(--bg-surface),
+        border 1px solid var(--border), border-radius 8px.
+        Label: 12px, var(--text-secondary), uppercase, letter-spacing
+        Value: 28px, tabular-nums, var(--text-primary), semi-bold
+        Delta: if positive → var(--red) with ↑ arrow
+               if negative → var(--green) with ↓ arrow
+               (inverted — cost decrease is good)
+        No shadow. No gradient. No icon unless passed as optional prop.
+
+─── SeverityBadge.tsx ───────────────────────────────────────────
+Props: { severity: "low" | "medium" | "high" | "critical" }
+
+Renders a small pill (no border, just background-color + text):
+  low:      background var(--accent-dim),  text var(--accent)
+  medium:   background var(--accent-med),  text var(--bg-base), opacity 0.8
+  high:     background var(--accent-full) at 60%, text var(--bg-base)
+  critical: background var(--accent-full), text var(--bg-base), font-weight 600
+
+NO red. NO green. NO blue. Amber opacity spectrum ONLY.
+
+─── DataTable.tsx ───────────────────────────────────────────────
+Props: { columns, data, total, page, pageSize, onPageChange, loading }
+
+Style:
+  Table: full width, border-collapse: collapse, no outer border
+  Header row: border-bottom 1px solid var(--border),
+              text 11px uppercase var(--text-secondary)
+  Body rows: border-bottom 1px solid var(--border) at 50% opacity
+             hover: background var(--bg-elevated)
+  Pagination: text-only prev/next with page count
+  No zebra striping. No cell borders.
+
+─── DateRangePicker.tsx ─────────────────────────────────────────
+Two <input type="date"> fields side by side.
+Style to match dark theme: background var(--bg-elevated),
+border 1px solid var(--border), color var(--text-primary),
+border-radius 6px, padding 6px 10px.
+
+─── CloudFilter.tsx ─────────────────────────────────────────────
+Pill-style toggle: All | AWS | Azure | GCP
+Active pill: background var(--accent-dim), border 1px solid var(--accent),
+             text var(--accent)
+Inactive: background transparent, border 1px solid var(--border),
+          text var(--text-secondary)
+
+─── Skeleton.tsx ────────────────────────────────────────────────
+Animated shimmer placeholder for loading states.
+background: linear-gradient from var(--bg-surface) to var(--bg-elevated)
+Use for MetricCard, table rows, and chart areas during data fetch.
+
+══════════════════════════════════════════════════════════════════
+STEP 6 — CHARTS (Recharts, fully custom styled)
+══════════════════════════════════════════════════════════════════
+
+ALL charts: no default Recharts colors.
+CartesianGrid: strokeDasharray="3 3", stroke="var(--border)", opacity 0.5
+XAxis/YAxis: stroke="var(--text-secondary)", fontSize=11
+Tooltip: background var(--bg-elevated), border var(--border),
+         color var(--text-primary), no default Recharts tooltip style
+
+─── SpendTrendChart.tsx ─────────────────────────────────────────
+Recharts AreaChart consuming /billing/trend data.
+
+Props: { data: TrendPoint[], loading: boolean }
+
+Single area: fill="var(--accent-dim)", stroke="var(--accent)",
+             strokeWidth=1.5, fillOpacity=1
+No dots on line. No legend.
+Y-axis: format as "$XXk" or "$X.Xm" (compact notation)
+X-axis: show only every Nth label to avoid crowding (auto-calculated)
+Height: 200px
+
+─── SpendByCloudChart.tsx ───────────────────────────────────────
+Recharts BarChart — horizontal bars, one per cloud.
+
+Props: { data: SpendByDimension[] }
+
+Bar fill colors (ONLY exception to single-accent rule — needed for
+multi-cloud differentiation):
+  aws:   #6366F1  (indigo)
+  azure: #8B5CF6  (violet)
+  gcp:   #06B6D4  (cyan)
+  other: var(--text-secondary)
+
+Bars are horizontal (layout="vertical"). Show % of total as label
+at end of bar. No grid lines — just the bar values.
+Height: 120px (compact — it's a summary widget)
+
+─── ForecastChart.tsx ───────────────────────────────────────────
+Recharts ComposedChart combining:
+  - Area for confidence band (upper_bound - lower_bound):
+      fill="var(--accent-dim)", no stroke, fillOpacity=1
+  - Line for predicted_cost:
+      stroke="var(--accent)", strokeWidth=2, no dots
+  - Optional: dashed vertical line at "today" separating
+    historical vs forecast
+
+Props: { data: ForecastItem[], horizonDays: number, loading: boolean }
+Height: 220px
+
+─── ShapDriversChart.tsx ────────────────────────────────────────
+Horizontal BarChart of top SHAP drivers.
+
+Props: { data: TopDriver[] }
+
+Bar fill: positive SHAP → var(--accent), negative → var(--text-secondary)
+Show feature name on Y-axis. Show avg_shap_value as label.
+Max 8 bars. Height: 180px.
+
+══════════════════════════════════════════════════════════════════
+STEP 7 — PAGES
+══════════════════════════════════════════════════════════════════
+
+─── OverviewPage.tsx ────────────────────────────────────────────
+Route: /
+
+Top row — 4 MetricCards (2 per row on mobile, 4 on desktop):
+  1. Total Spend (selected period) — from /billing/by-cloud sum
+  2. Anomalies Detected — from /anomalies/summary total_anomalies
+  3. Critical Anomalies — from by_severity.critical
+  4. Forecast (next 30d) — from /forecasts/latest sum of predicted_cost
+
+Row 2:
+  Left (60%): SpendTrendChart — /billing/trend (daily granularity)
+  Right (40%): SpendByCloudChart — /billing/by-cloud
+
+Row 3:
+  Left (60%): Recent Anomalies — last 5 from /anomalies/recent
+              rendered as a compact table (date, cloud, service,
+              severity badge, deviation %)
+  Right (40%): Budget Risk card — /forecasts/budget-risk for selected cloud
+               Shows breach_risk level with amber indicator,
+               projected vs budget as two horizontal bars,
+               breach_date if applicable
+
+─── AnomaliesPage.tsx ───────────────────────────────────────────
+Route: /anomalies
+
+Top: AnomalySummary stats — 4 small counts (total, critical, high, medium)
+     displayed inline as text, NOT as MetricCards (too important to waste
+     card space on a detail page)
+
+Filter bar: severity dropdown (All|Critical|High|Medium|Low) +
+            cloud filter (reuses CloudFilter component)
+
+Main: DataTable of AnomalyListItem
+  Columns: Date | Cloud | Service | Severity | Actual Cost |
+           Expected Cost | Deviation % | Method
+  Clicking a row opens AnomalyDrawer
+
+AnomalyDrawer.tsx:
+  Slide-in panel from right (width: 420px)
+  Shows full anomaly detail:
+    - Severity badge + detection method
+    - Actual vs Expected cost with difference
+    - Z-score (if available)
+    - Service, Cloud, Region, Account
+    - usage_date
+  No charts in drawer (keep it fast)
+  Close button top-right
+
+─── ForecastPage.tsx ────────────────────────────────────────────
+Route: /forecasts
+
+Top: Horizon selector — pill tabs: 7d | 14d | 30d | 90d
+     (changes horizon_days param on all fetch calls)
+
+Row 1: ForecastChart — full width, for selected cloud + horizon
+       Title shows: "{Cloud} — {Horizon} Day Forecast"
+
+Row 2: Budget Risk section — calls /forecasts/budget-risk
+  Input field: "Monthly Budget (USD)" — user can type a number
+  On change (debounced 500ms): refetch budget-risk
+  Display: breach_risk as a prominent text status
+    none:     dim text "No breach expected"
+    possible: amber text "Breach Possible"
+    likely:   amber text + amber background pill "Breach Likely"
+    certain:  full amber "Breach Expected by {breach_date}"
+  Below: projected monthly vs budget as two stat lines
+
+Row 3: Forecast data table
+  Columns: Forecast Date | Predicted Cost | Lower Bound |
+           Upper Bound | Model | Confidence Band Width
+  Paginated, 20 rows per page
+
+─── AttributionPage.tsx ─────────────────────────────────────────
+Route: /attribution
+
+Left panel (35%): Top Cost Drivers
+  ShapDriversChart — /attribution/top-drivers
+  Below chart: small table of driver name + avg SHAP + appearances
+
+Right panel (65%): Attribution Detail
+  Two dropdowns: Cloud selector + Service selector
+  (Service options populated from distinct services in attribution data)
+  On selection: fetch /attribution/{cloud}/{service}
+  Show DataTable with columns:
+    Date | Total Cost | Top Driver | SHAP Value | #2 Driver | #2 Value
+  Below table: SpendTrendChart for that group's total_cost_usd over time
+
+══════════════════════════════════════════════════════════════════
+STEP 8 — ROUTING
+══════════════════════════════════════════════════════════════════
+
+Use react-router-dom v6.
+
+App.tsx:
+  <FilterProvider>         ← wraps everything
+    <BrowserRouter>
+      <div style={{ display: 'flex' }}>
+        <Sidebar />
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <TopBar />
+          <PageWrapper>
+            <Routes>
+              <Route path="/"            element={<OverviewPage />} />
+              <Route path="/anomalies"   element={<AnomaliesPage />} />
+              <Route path="/forecasts"   element={<ForecastPage />} />
+              <Route path="/attribution" element={<AttributionPage />} />
+            </Routes>
+          </PageWrapper>
+        </div>
+      </div>
+    </BrowserRouter>
+  </FilterProvider>
+
+══════════════════════════════════════════════════════════════════
+package.json dependencies
+══════════════════════════════════════════════════════════════════
+
+{
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.22.0",
+    "recharts": "^2.12.0",
+    "lucide-react": "^0.383.0",
+    "date-fns": "^3.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "typescript": "^5.2.0",
+    "vite": "^5.1.0"
+  }
+}
+
+══════════════════════════════════════════════════════════════════
+VALIDATION CHECKLIST
+══════════════════════════════════════════════════════════════════
+
+[ ] npm run dev starts without errors on http://localhost:3000
+
+[ ] tokens.css — all 10 CSS variables defined, no hardcoded colors
+    anywhere in component files
+
+[ ] Sidebar — navigation works, active state highlights correctly,
+    health dot reflects /health API status
+
+[ ] OverviewPage loads:
+    - 4 MetricCards populated from real API data
+    - SpendTrendChart renders with amber area + no default colors
+    - SpendByCloudChart shows 3 clouds in indigo/violet/cyan
+    - Recent anomalies table has data
+    - Budget risk card shows breach_risk status
+
+[ ] AnomaliesPage:
+    - DataTable loads with correct columns
+    - Severity filter works (re-fetches with severity param)
+    - Clicking row opens AnomalyDrawer
+    - Drawer shows correct anomaly_id-based detail
+
+[ ] ForecastPage:
+    - Horizon tabs switch correctly (refetches)
+    - ForecastChart renders confidence band (area) + line
+    - Budget input triggers debounced re-fetch
+    - breach_risk changes dynamically as budget changes
+
+[ ] AttributionPage:
+    - ShapDriversChart populated from /attribution/top-drivers
+    - Cloud + service dropdowns populated
+    - Selecting combination loads detail table
+
+[ ] All loading states show Skeleton components (not blank divs)
+[ ] All empty states show EmptyState component (not null render)
+[ ] No console errors on any page
+[ ] No hardcoded colors (only CSS variables)
+[ ] SeverityBadge uses ONLY amber opacity variants
+
+══════════════════════════════════════════════════════════════════
+DO NOT IMPLEMENT
+══════════════════════════════════════════════════════════════════
+- No authentication UI (Module 12)
+- No WebSocket / real-time updates
+- No export to CSV/PDF
+- No dark/light mode toggle (dark only)
+- No unit tests for frontend (Module 12)
+- No alerting configuration UI (Module 11 is backend alerting only)
+
+══════════════════════════════════════════════════════════════════
+REPORT BACK AFTER RUNNING
+══════════════════════════════════════════════════════════════════
+1. Screenshot or description of OverviewPage — does it look
+   minimal and dark with amber accents, or did any default
+   Recharts colors bleed through?
+2. AnomalyDrawer — does it open correctly on row click?
+3. ForecastPage budget input — does breach_risk update when
+   typing a lower budget?
+4. AttributionPage — which service shows the most interesting
+   SHAP breakdown?
+5. Any API 404s or CORS errors in browser console?
+6. Any deviations from the color tokens or component structure?
+
+Waiting for your summary before generating Prompt 11 (Alerting System).
+
+PROMPT-11:
+╔══════════════════════════════════════════════════════════════════╗
+║   PROMPT 11: Alerting System + Frontend Fixes                    ║
+║   Cloud FinOps Intelligence Platform                             ║
+╚══════════════════════════════════════════════════════════════════╝
+
+OBJECTIVE
+─────────
+Two parallel deliverables:
+
+A) Backend alerting system that evaluates anomalies and forecast
+   breach risks, generates alerts, and persists them to a new
+   `alerts` table — consumed by the API and dashboard.
+
+B) Frontend fixes identified from Prompt 10 review:
+   - Budget breach_risk input not triggering dynamic re-fetch
+   - Cloud filter not respected on all data views (some views
+     hardcode or default to AWS only — must use global FilterContext
+     cloud value across ALL API calls on ALL pages)
+
+Both live in: alerting/  and  frontend/src/  respectively.
+
+LOCKED CONTRACTS — DO NOT MODIFY
+─────────────────────────────────
+- All shared/schemas/ files — UNTOUCHED
+- api/ routers — UNTOUCHED except: ADD two new endpoints to
+  api/routers/alerts.py (new file) and mount in api/main.py
+- TimescaleDB: host=127.0.0.1, port=5433
+- Frontend color tokens — UNTOUCHED
+- API base URL: http://localhost:8000
+- All existing frontend components — UNTOUCHED unless fixing
+  the two bugs listed above
+
+══════════════════════════════════════════════════════════════════
+PART A — BACKEND ALERTING SYSTEM
+══════════════════════════════════════════════════════════════════
+
+STEP A1 — DB SCHEMA
+File: alerting/init_db/alerts_schema.sql  (idempotent)
+
+CREATE TABLE IF NOT EXISTS alerts (
+    alert_id        TEXT        NOT NULL DEFAULT gen_random_uuid()::text,
+    alert_type      TEXT        NOT NULL,
+    -- "anomaly_detected" | "budget_breach_imminent" |
+    -- "spend_spike" | "forecast_exceeded"
+    severity        TEXT        NOT NULL,
+    -- "low" | "medium" | "high" | "critical"
+    cloud_provider  TEXT        NOT NULL,
+    service_category TEXT,
+    account_id      TEXT,
+    alert_date      DATE        NOT NULL,
+    title           TEXT        NOT NULL,
+    message         TEXT        NOT NULL,
+    metadata        JSONB,
+    -- arbitrary context: z_score, deviation_pct, budget, etc.
+    is_resolved     BOOLEAN     NOT NULL DEFAULT FALSE,
+    resolved_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (alert_date, alert_id)
+);
+
+SELECT create_hypertable(
+    'alerts', 'alert_date',
+    chunk_time_interval => INTERVAL '30 days',
+    if_not_exists => TRUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_severity
+    ON alerts (severity, alert_date DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_cloud
+    ON alerts (cloud_provider, alert_date DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_resolved
+    ON alerts (is_resolved, alert_date DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_type
+    ON alerts (alert_type, alert_date DESC);
+
+──────────────────────────────────────────────────────────────────
+STEP A2 — PYDANTIC SCHEMA
+File: shared/schemas/alert.py  (NEW)
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from datetime import date, datetime
+import uuid
+
+class Alert(BaseModel):
+    alert_id:        str = Field(default_factory=lambda: str(uuid.uuid4()))
+    alert_type:      str
+    severity:        str
+    cloud_provider:  str
+    service_category: Optional[str]
+    account_id:      Optional[str]
+    alert_date:      date
+    title:           str
+    message:         str
+    metadata:        Dict[str, Any] = {}
+    is_resolved:     bool = False
+    resolved_at:     Optional[datetime] = None
+    created_at:      Optional[datetime] = None
+
+    class Config:
+        json_encoders = {date: str, datetime: str}
+
+──────────────────────────────────────────────────────────────────
+STEP A3 — ALERT RULES ENGINE
+File: alerting/rules.py
+
+Four rule types. Each takes relevant data and returns List[Alert].
+All thresholds configurable via alerting/config.py.
+
+File: alerting/config.py
+  Z_SCORE_THRESHOLDS = {
+      "low":      2.0,
+      "medium":   2.5,
+      "high":     3.0,
+      "critical": 4.0
+  }
+  SPEND_SPIKE_PCT_THRESHOLD = 50.0   # pct_change_1d > 50% → alert
+  BUDGET_WARNING_PCT        = 85.0   # projected >= 85% of budget → alert
+  BUDGET_BREACH_PCT         = 100.0  # projected >= 100% → critical alert
+
+class AlertRulesEngine:
+
+    def evaluate_anomaly(
+        self, anomaly: dict, billing_context: dict
+    ) -> Optional[Alert]:
+        """
+        Triggered per anomaly row from the anomalies table.
+        Map anomaly.severity → alert.severity directly.
+        title: "Anomaly: {service} spend spike on {date}"
+        message: "Detected {deviation_pct:.1f}% above expected cost
+                  (${actual_cost:.2f} vs ${expected_cost:.2f})"
+        metadata: { z_score, deviation_pct, detection_method,
+                    actual_cost, expected_cost }
+        alert_type: "anomaly_detected"
+        """
+
+    def evaluate_spend_spike(
+        self, feature_row: dict
+    ) -> Optional[Alert]:
+        """
+        Triggered per spend_features row where
+        ABS(pct_change_1d) > SPEND_SPIKE_PCT_THRESHOLD.
+        severity: "high" if pct_change > 100%, else "medium"
+        title: "{cloud} {service} spend up {pct:.0f}% day-over-day"
+        alert_type: "spend_spike"
+        """
+
+    def evaluate_budget_breach(
+        self,
+        cloud_provider: str,
+        projected_monthly_cost: float,
+        monthly_budget_usd: float,
+        breach_date: Optional[str]
+    ) -> Optional[Alert]:
+        """
+        pct_used = projected / budget * 100
+        If pct_used >= BUDGET_BREACH_PCT:
+            severity = "critical"
+            title = "{cloud} budget breach projected by {breach_date}"
+        elif pct_used >= BUDGET_WARNING_PCT:
+            severity = "high"
+            title = "{cloud} budget at {pct_used:.0f}% — breach risk"
+        Else: return None
+        alert_type: "budget_breach_imminent"
+        metadata: { projected, budget, pct_used, breach_date }
+        """
+
+──────────────────────────────────────────────────────────────────
+STEP A4 — ALERT REPOSITORY
+File: alerting/repository.py
+
+class AlertRepository:
+
+    def insert_alerts(self, alerts: List[Alert]) -> int:
+        """
+        Bulk insert into alerts table.
+        ON CONFLICT (alert_date, alert_id) DO NOTHING.
+        Use execute_values() in batches of 500.
+        Returns rows inserted.
+        """
+
+    def get_alerts(
+        self,
+        start_date: date,
+        end_date: date,
+        severity: Optional[str] = None,
+        cloud_provider: Optional[str] = None,
+        alert_type: Optional[str] = None,
+        is_resolved: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> Tuple[List[Alert], int]:
+        """
+        Returns (alerts, total_count) for pagination.
+        """
+
+    def resolve_alert(self, alert_id: str) -> bool:
+        """
+        UPDATE alerts SET is_resolved=TRUE, resolved_at=NOW()
+        WHERE alert_id = %s
+        Returns True if row updated.
+        """
+
+    def get_unresolved_count(self) -> Dict[str, int]:
+        """
+        SELECT severity, COUNT(*) FROM alerts
+        WHERE is_resolved = FALSE
+        GROUP BY severity
+        Returns {"low": N, "medium": N, "high": N, "critical": N}
+        """
+
+──────────────────────────────────────────────────────────────────
+STEP A5 — ALERTING ENGINE (ORCHESTRATOR)
+File: alerting/engine.py
+
+class AlertingEngine:
+
+    def run(
+        self,
+        start_date: date,
+        end_date: date,
+        cloud_provider: Optional[str] = None,
+        monthly_budget_usd: Optional[float] = None
+    ) -> dict:
+        """
+        Step 1: Query anomalies table for date range + cloud filter
+                → evaluate_anomaly() per row → collect Alert objects
+
+        Step 2: Query spend_features for rows where
+                ABS(pct_change_1d) > SPEND_SPIKE_PCT_THRESHOLD
+                → evaluate_spend_spike() per row → collect Alerts
+
+        Step 3: If monthly_budget_usd provided:
+                Call /forecasts/budget-risk equivalent logic
+                (query forecasts table directly — do not call the API)
+                → evaluate_budget_breach() → collect Alert if triggered
+
+        Step 4: Deduplicate alerts:
+                Skip insert if identical (alert_type, cloud_provider,
+                service_category, alert_date) already exists in DB
+                (query before bulk insert)
+
+        Step 5: AlertRepository.insert_alerts(all_alerts)
+
+        Step 6: Return summary:
+                {
+                  "anomaly_alerts": int,
+                  "spend_spike_alerts": int,
+                  "budget_alerts": int,
+                  "total_inserted": int,
+                  "total_skipped": int,
+                  "duration_seconds": float
+                }
+        """
+
+──────────────────────────────────────────────────────────────────
+STEP A6 — NEW API ENDPOINTS
+File: api/routers/alerts.py  (NEW)
+Mount in api/main.py: prefix="/alerts", tags=["Alerts"]
+
+GET /alerts
+  Params: start_date, end_date, severity, cloud_provider,
+          alert_type, is_resolved, page, page_size
+  Returns: PaginatedResponse[AlertListItem]
+
+GET /alerts/summary
+  Params: start_date, end_date
+  Returns:
+  {
+    "total": int,
+    "unresolved": int,
+    "by_severity": {"low": N, "medium": N, "high": N, "critical": N},
+    "by_type": {"anomaly_detected": N, "spend_spike": N, ...},
+    "by_cloud": {"aws": N, ...}
+  }
+
+PATCH /alerts/{alert_id}/resolve
+  Body: none
+  Action: AlertRepository.resolve_alert(alert_id)
+  Returns: {"resolved": true, "alert_id": str}
+
+Add to api/schemas/responses.py:
+class AlertListItem(BaseModel):
+    alert_id:        str
+    alert_type:      str
+    severity:        str
+    cloud_provider:  str
+    service_category: Optional[str]
+    alert_date:      str
+    title:           str
+    message:         str
+    is_resolved:     bool
+    created_at:      str
+
+──────────────────────────────────────────────────────────────────
+STEP A7 — CLI
+File: alerting/main.py
+
+python alerting/main.py [OPTIONS]
+
+Options:
+  --start    YYYY-MM-DD  (required)
+  --end      YYYY-MM-DD  (required)
+  --cloud    aws|azure|gcp|all  (default: all)
+  --budget   float  (optional monthly budget in USD)
+
+Output:
+  Anomaly alerts generated:    N
+  Spend spike alerts:          N
+  Budget alerts:               N
+  Total inserted:              N
+  Total skipped (dedup):       N
+  Duration:                    X.Xs
+
+──────────────────────────────────────────────────────────────────
+FILE STRUCTURE
+──────────────────────────────────────────────────────────────────
+alerting/
+├── __init__.py
+├── requirements.txt
+├── config.py
+├── rules.py
+├── engine.py
+├── repository.py
+├── main.py
+├── init_db/
+│   └── alerts_schema.sql
+└── tests/
+    ├── __init__.py
+    ├── test_rules.py       ← no DB
+    └── test_engine.py      ← requires TimescaleDB
+
+shared/schemas/alert.py     ← NEW only
+
+══════════════════════════════════════════════════════════════════
+PART B — FRONTEND FIXES
+══════════════════════════════════════════════════════════════════
+
+FIX 1 — Cloud filter not respected across all views
+─────────────────────────────────────────────────────
+Root cause: Some API calls hardcode cloud_provider="aws" or omit
+the cloud param entirely instead of reading from FilterContext.
+
+Fix in every file that makes API calls:
+  - Read `cloud` from `useContext(FilterContext)`
+  - Pass to API: cloud_provider = cloud === "all" ? undefined : cloud
+    (when cloud="all", omit the param — backend returns all clouds)
+  - This must be applied in:
+      src/pages/OverviewPage.tsx       — all 5 fetch calls
+      src/pages/AnomaliesPage.tsx      — anomalies list fetch
+      src/pages/ForecastPage.tsx       — forecasts + budget-risk fetch
+      src/pages/AttributionPage.tsx    — top-drivers + detail fetch
+  - Also: when cloud filter changes in TopBar, all active page
+    fetches must re-run. Ensure cloud is in the useEffect
+    dependency array everywhere.
+
+FIX 2 — Budget breach_risk not updating dynamically
+─────────────────────────────────────────────────────
+Root cause: The budget input's onChange is not triggering a
+re-fetch, or the debounce is not wired to the fetch function.
+
+Fix in src/pages/ForecastPage.tsx:
+  const [budget, setBudget] = useState<number>(50000)
+  const [debouncedBudget, setDebouncedBudget] = useState(budget)
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedBudget(budget), 500)
+    return () => clearTimeout(t)
+  }, [budget])
+
+  useEffect(() => {
+    if (debouncedBudget > 0) fetchBudgetRisk(debouncedBudget)
+  }, [debouncedBudget, cloud, startDate, endDate])
+
+  The input must show the current budget value and update on change:
+  <input
+    type="number"
+    value={budget}
+    onChange={e => setBudget(Number(e.target.value))}
+  />
+
+FIX 3 — Add Alerts section to OverviewPage sidebar + page
+──────────────────────────────────────────────────────────
+Add "Alerts" nav item to Sidebar.tsx:
+  Icon: Bell (Lucide)
+  Route: /alerts
+
+Add AlertsPage.tsx at src/pages/AlertsPage.tsx:
+
+  Top: Summary bar — unresolved count by severity
+       (4 inline numbers, not cards — same pattern as AnomaliesPage)
+       Fetch from GET /alerts/summary
+
+  Filter bar: severity | alert_type | cloud | is_resolved toggle
+
+  Main: DataTable of AlertListItem
+    Columns: Date | Cloud | Type | Severity | Title | Status
+    "Status" column: if is_resolved → dim text "Resolved"
+                     if not → SeverityBadge (amber opacity)
+    Clicking row: inline expand (accordion, not drawer) showing
+                  full message text
+
+  Resolve button: small amber text button on each unresolved row
+    On click: PATCH /alerts/{alert_id}/resolve → refetch list
+
+  Add route in App.tsx:
+    <Route path="/alerts" element={<AlertsPage />} />
+
+Add to src/api/: alerts.ts with getAlerts(), getAlertsSummary(),
+resolveAlert() functions matching the new endpoints.
+
+Add to src/types/index.ts:
+  interface AlertListItem { ...all fields from Step A6 schema... }
+  interface AlertSummary {
+    total: number
+    unresolved: number
+    by_severity: Record<string, number>
+    by_type: Record<string, number>
+    by_cloud: Record<string, number>
+  }
+
+══════════════════════════════════════════════════════════════════
+alerting/requirements.txt
+══════════════════════════════════════════════════════════════════
+pydantic>=2.0.0
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.0
+click>=8.1.0
+rich>=13.0.0
+python-dotenv>=1.0.0
+
+══════════════════════════════════════════════════════════════════
+TESTS
+══════════════════════════════════════════════════════════════════
+
+─── test_rules.py (NO DB) ───────────────────────────────────────
+Test 1: evaluate_anomaly() with severity="critical"
+        → Alert.severity == "critical", alert_type == "anomaly_detected"
+Test 2: evaluate_anomaly() with severity="low"
+        → Alert returned with correct title/message format
+Test 3: evaluate_spend_spike() with pct_change_1d=120.0
+        → Alert.severity == "high"
+Test 4: evaluate_spend_spike() with pct_change_1d=60.0
+        → Alert.severity == "medium"
+Test 5: evaluate_spend_spike() with pct_change_1d=10.0
+        → returns None (below threshold)
+Test 6: evaluate_budget_breach() projected=95000, budget=100000
+        → Alert returned (severity="high"), pct_used≈95%
+Test 7: evaluate_budget_breach() projected=105000, budget=100000
+        → Alert severity="critical"
+Test 8: evaluate_budget_breach() projected=50000, budget=100000
+        → returns None
+
+─── test_engine.py (REQUIRES TIMESCALEDB 127.0.0.1:5433) ────────
+Test 1: engine.run(2023-01-01, 2023-12-31)
+        → total_inserted > 0
+        → anomaly_alerts > 0 (anomalies table has data)
+Test 2: Re-run same range → total_skipped == total from Test 1
+        (deduplication works)
+Test 3: engine.run with monthly_budget_usd=1000
+        (very low — should trigger budget alert on any cloud)
+        → budget_alerts > 0
+Test 4: GET /alerts/summary via TestClient → status 200,
+        by_severity has all 4 keys
+
+══════════════════════════════════════════════════════════════════
+VALIDATION CHECKLIST
+══════════════════════════════════════════════════════════════════
+
+BACKEND:
+[ ] alerts_schema.sql executed — alerts hypertable exists
+[ ] shared/schemas/alert.py — Alert model defined
+[ ] alerting/rules.py — 3 rule methods, all thresholds from config.py
+[ ] alerting/engine.py — deduplication logic, 3-step evaluation
+[ ] alerting/repository.py — insert, get, resolve, unresolved_count
+[ ] api/routers/alerts.py — GET /alerts, /summary, PATCH /resolve
+[ ] api/main.py — alerts router mounted
+
+[ ] CLI validation:
+    python alerting/main.py --start 2023-01-01 --end 2023-12-31 --budget 50000
+    Expected: anomaly_alerts > 0, spend_spike_alerts > 0,
+              budget_alerts: 0 or 1 depending on forecast data
+
+FRONTEND:
+[ ] Cloud filter change triggers re-fetch on ALL 4 pages
+[ ] cloud="all" sends no cloud_provider param (returns all 3 clouds)
+[ ] ForecastPage budget input updates breach_risk on typing
+[ ] AlertsPage loads with summary + filterable DataTable
+[ ] Resolve button marks alert as resolved and refreshes list
+[ ] Alerts nav item in sidebar with Bell icon
+[ ] All existing pages still work (no regressions)
+
+══════════════════════════════════════════════════════════════════
+DO NOT IMPLEMENT
+══════════════════════════════════════════════════════════════════
+- No email/Slack/webhook notifications (would require external
+  services — out of scope for this build)
+- No real-time alert streaming (WebSocket)
+- No authentication (Module 12)
+- Do not modify detection/, forecasting/, attribution/,
+  normalization/, ingestion/
+
+══════════════════════════════════════════════════════════════════
+REPORT BACK AFTER RUNNING
+══════════════════════════════════════════════════════════════════
+1. CLI output — anomaly_alerts, spend_spike_alerts, budget_alerts,
+   total_inserted, skipped
+2. Second CLI run — was total_skipped == first run's total_inserted?
+   (dedup validation)
+3. GET /alerts/summary — what are the by_severity counts?
+4. Frontend: switching cloud filter from ALL → AWS → GCP —
+   do all 4 pages update their data?
+5. ForecastPage: typing a budget of $5,000 — does breach_risk
+   change to "certain"?
+6. AlertsPage: does the resolve button work and update the row?
+7. Test results — pass/fail for both test files
+8. Any deviations from schema or alert logic
+
+Waiting for your summary before generating Prompt 12 (Integration & Testing).
+
+PROMPT-12:
+╔══════════════════════════════════════════════════════════════════╗
+║        PROMPT 12: Integration, Data Backfill & Frontend Fixes   ║
+║        Cloud FinOps Intelligence Platform                        ║
+╚══════════════════════════════════════════════════════════════════╝
+
+OBJECTIVE
+─────────
+This prompt does four things in strict order:
+
+  1. BACKFILL — Ingest full 2023+2024 data for AWS, Azure, and GCP
+     through the complete pipeline (normalization → storage →
+     features → anomaly detection → forecasting → attribution →
+     alerting), so all three clouds have real data powering the
+     dashboard.
+
+  2. FRONTEND FIXES — Fix the empty forecast chart, the empty
+     Azure/GCP anomaly views, and the date range defaulting to
+     today instead of actual data bounds.
+
+  3. FORECAST PAGE REDESIGN — Rebuild the forecast chart to show
+     both an aggregated cloud-level view AND a per-service drill-
+     down, using the correct API call patterns.
+
+  4. INTEGRATION TESTS — Write end-to-end tests that validate the
+     full pipeline and all API contracts with real multi-cloud data.
+
+LOCKED CONTRACTS — DO NOT MODIFY
+─────────────────────────────────
+- All shared/schemas/ files — UNTOUCHED
+- synthetic_data/ — UNTOUCHED (do NOT re-run the generator)
+- storage/client.py, storage/db.py — UNTOUCHED
+- api/ routers and response schemas — UNTOUCHED
+- detection/, forecasting/, attribution/, alerting/ — UNTOUCHED
+- TimescaleDB: host=127.0.0.1, port=5433, db=finops,
+  user=finops_user, password=finops_pass
+- API URL: http://localhost:8000
+- Frontend dev URL: http://localhost:3000
+
+══════════════════════════════════════════════════════════════════
+PART 1 — FULL DATA BACKFILL
+══════════════════════════════════════════════════════════════════
+
+The current DB has only AWS data for 2023. This part ingests and
+processes ALL three clouds for BOTH 2023 and 2024.
+
+─────────────────────────────────────────────────────────────────
+Step 1.1 — Ingest + Normalize + Store (all three clouds, 2023+2024)
+─────────────────────────────────────────────────────────────────
+
+Run the ingestion pipeline for azure and gcp for the full range.
+AWS 2023 is already ingested — skip it, do not re-ingest.
+AWS 2024, Azure 2023+2024, GCP 2023+2024 must all be ingested.
+
+Use the existing ingestion/main.py CLI:
+
+  python ingestion/main.py --mode synthetic --cloud azure \
+    --start 2023-01-01 --end 2024-12-31
+
+  python ingestion/main.py --mode synthetic --cloud gcp \
+    --start 2023-01-01 --end 2024-12-31
+
+  python ingestion/main.py --mode synthetic --cloud aws \
+    --start 2024-01-01 --end 2024-12-31
+
+Then run normalization for each new batch and upsert into
+billing_records via StorageClient. The normalization pipeline
+already exists — just invoke it for the new date ranges and clouds.
+
+After storage:
+  SELECT cloud_provider, COUNT(*), MIN(usage_date), MAX(usage_date)
+  FROM billing_records
+  GROUP BY cloud_provider;
+
+Expected output (approximate):
+  aws   | ~58,000  | 2023-01-01 | 2024-12-31
+  azure | ~44,000  | 2023-01-01 | 2024-12-31
+  gcp   | ~37,000  | 2023-01-01 | 2024-12-31
+
+─────────────────────────────────────────────────────────────────
+Step 1.2 — Feature Engineering (new data only)
+─────────────────────────────────────────────────────────────────
+
+Run feature engineering for the ranges not yet in spend_features.
+
+  python features/main.py --start 2023-01-01 --end 2024-12-31 \
+    --cloud azure
+
+  python features/main.py --start 2023-01-01 --end 2024-12-31 \
+    --cloud gcp
+
+  python features/main.py --start 2024-01-01 --end 2024-12-31 \
+    --cloud aws
+
+Verify:
+  SELECT cloud_provider, COUNT(*), MIN(feature_date), MAX(feature_date)
+  FROM spend_features
+  GROUP BY cloud_provider;
+
+─────────────────────────────────────────────────────────────────
+Step 1.3 — Anomaly Detection (all clouds, full range)
+─────────────────────────────────────────────────────────────────
+
+Run detection in train_predict mode for all clouds:
+
+  python detection/run_detection.py \
+    --cloud azure --start 2023-01-01 --end 2024-12-31 \
+    --mode train_predict
+
+  python detection/run_detection.py \
+    --cloud gcp --start 2023-01-01 --end 2024-12-31 \
+    --mode train_predict
+
+  python detection/run_detection.py \
+    --cloud aws --start 2024-01-01 --end 2024-12-31 \
+    --mode predict
+    # AWS models already trained on 2023 — predict only for 2024
+
+Verify:
+  SELECT cloud_provider, COUNT(*), MIN(usage_date), MAX(usage_date)
+  FROM anomalies
+  GROUP BY cloud_provider;
+
+Expected: rows for aws, azure, gcp all present.
+
+─────────────────────────────────────────────────────────────────
+Step 1.4 — Forecasting (all clouds, full range)
+─────────────────────────────────────────────────────────────────
+
+  python forecasting/run_forecasting.py \
+    --cloud azure --start 2023-01-01 --end 2024-12-31 \
+    --force-retrain
+
+  python forecasting/run_forecasting.py \
+    --cloud gcp --start 2023-01-01 --end 2024-12-31 \
+    --force-retrain
+
+  python forecasting/run_forecasting.py \
+    --cloud aws --start 2023-01-01 --end 2024-12-31 \
+    --force-retrain
+    # Retrain AWS too with the full 2-year history for better models
+
+Verify:
+  SELECT cloud_provider, service,
+         COUNT(*) as forecast_rows,
+         MIN(forecast_date), MAX(forecast_date)
+  FROM forecasts
+  GROUP BY cloud_provider, service
+  ORDER BY cloud_provider, service;
+
+─────────────────────────────────────────────────────────────────
+Step 1.5 — Attribution (all clouds, full range)
+─────────────────────────────────────────────────────────────────
+
+  python attribution/main.py \
+    --start 2023-01-01 --end 2024-12-31 \
+    --cloud azure --force-retrain
+
+  python attribution/main.py \
+    --start 2023-01-01 --end 2024-12-31 \
+    --cloud gcp --force-retrain
+
+  python attribution/main.py \
+    --start 2023-01-01 --end 2024-12-31 \
+    --cloud aws --force-retrain
+
+─────────────────────────────────────────────────────────────────
+Step 1.6 — Alerting (all clouds, full range)
+─────────────────────────────────────────────────────────────────
+
+  python alerting/main.py \
+    --start 2023-01-01 --end 2024-12-31
+
+Verify:
+  SELECT by_cloud from GET /alerts/summary
+  Expected: aws, azure, gcp all have alert counts > 0
+
+══════════════════════════════════════════════════════════════════
+PART 2 — FRONTEND FIXES
+══════════════════════════════════════════════════════════════════
+
+All frontend changes are in frontend/src/ only.
+Do NOT modify the API, shared schemas, or any backend module.
+
+─────────────────────────────────────────────────────────────────
+Fix 2.1 — Date Range Defaults
+─────────────────────────────────────────────────────────────────
+
+PROBLEM: The date picker defaults to today (2026) as the end date,
+but actual data ends at 2024-12-31. This makes all charts appear
+empty for the default range.
+
+FIX: On app mount, fetch the actual data bounds from the API:
+
+  GET /billing/trend?start_date=2020-01-01&end_date=2030-12-31
+    &granularity=month&page_size=1
+
+  Or better — add a new lightweight endpoint to the billing router:
+
+  GET /billing/bounds
+  Response: { "min_date": "2023-01-01", "max_date": "2024-12-31" }
+
+  SQL:
+    SELECT
+      MIN(usage_date)::text AS min_date,
+      MAX(usage_date)::text AS max_date
+    FROM billing_records
+
+Add this endpoint to api/routers/billing.py.
+
+In the frontend, fetch /billing/bounds on App mount and store
+the result in a React context (DataBoundsContext):
+
+  const DataBoundsContext = createContext({
+    minDate: "2023-01-01",
+    maxDate: "2024-12-31"   // safe fallback
+  });
+
+Default date range for all pages:
+  start_date = maxDate minus 365 days  (last 12 months of real data)
+  end_date   = maxDate
+
+The date picker's max selectable date = maxDate (never today).
+The date picker's min selectable date = minDate.
+
+This change must apply to ALL pages: Overview, Anomalies,
+Forecasts, Attribution, Alerts.
+
+─────────────────────────────────────────────────────────────────
+Fix 2.2 — Azure/GCP Anomaly Views Now Have Data
+─────────────────────────────────────────────────────────────────
+
+After Part 1 backfill, Azure and GCP will have anomaly rows.
+No frontend code change needed for this — just verify that
+switching to Azure or GCP in the cloud filter on AnomalyPage
+returns data after the backfill.
+
+If the cloud filter is still not wired to the useEffect dependency
+array on AnomalyPage (the bug from Module 10), fix it:
+
+  useEffect(() => {
+    fetchAnomalies({ cloud_provider: selectedCloud, ...dateRange });
+  }, [selectedCloud, dateRange.start, dateRange.end]);  // all three deps
+
+─────────────────────────────────────────────────────────────────
+Fix 2.3 — Overview Page Data Recency
+─────────────────────────────────────────────────────────────────
+
+The Overview page spend trend chart likely queries a hardcoded
+2023 range. Replace all hardcoded date strings with values from
+DataBoundsContext. The default view should show the last 12 months
+of real data, not a fixed 2023 window.
+
+══════════════════════════════════════════════════════════════════
+PART 3 — FORECAST PAGE REDESIGN
+══════════════════════════════════════════════════════════════════
+
+This is the most substantial frontend change. The current forecast
+page has an empty chart. Rebuild it with two distinct sections.
+
+─────────────────────────────────────────────────────────────────
+Section A — Aggregated Cloud Forecast Chart (top section)
+─────────────────────────────────────────────────────────────────
+
+PURPOSE: Show total projected spend for the selected cloud across
+ALL services combined, for the selected horizon.
+
+API call:
+  GET /forecasts?cloud_provider={cloud}&horizon_days={horizon}
+    &model_used=ensemble&page_size=500
+
+Data transformation (in the component, not the API):
+  Group results by forecast_date.
+  Sum predicted_cost, lower_bound, upper_bound across all services
+  for each date.
+  Result: one row per date with aggregated cost + confidence band.
+
+Chart spec (Recharts ComposedChart):
+  - X axis: forecast_date (formatted as "MMM DD")
+  - Y axis: cost in USD (formatted as "$XX,XXX")
+  - Area chart for confidence band:
+      dataKey="lower_bound" fill="rgba(245,158,11,0.08)" stroke="none"
+      dataKey="upper_bound" fill="rgba(245,158,11,0.08)" stroke="none"
+      Use ReferenceArea between lower and upper for the shaded band.
+  - Line chart for predicted_cost:
+      stroke="#F59E0B" strokeWidth=2 dot=false
+  - No grid lines — only faint horizontal reference lines at
+    Y axis ticks (stroke="#2A2A3D")
+  - Tooltip: shows date + predicted cost + confidence range
+    styled to match the dark theme (background: #1C1C27,
+    border: 1px solid #2A2A3D, text: #E8E8F0)
+  - If no data: show a styled empty state — NOT the generic
+    "No data available" text. Use:
+      <div> with amber icon + "No forecast data for {cloud} —
+      run the forecasting pipeline for this cloud provider." </div>
+
+─────────────────────────────────────────────────────────────────
+Section B — Per-Service Forecast Drill-down (bottom section)
+─────────────────────────────────────────────────────────────────
+
+PURPOSE: Let the user pick a specific service and see its
+individual forecast line.
+
+Step 1 — Service selector:
+  On mount (when cloud changes), fetch:
+    GET /billing/by-service?start_date={minDate}&end_date={maxDate}
+      &cloud_provider={cloud}&top_n=20
+
+  Populate a dropdown with the returned service names.
+  Default selection: first service in the list.
+  Style: matches the existing pill/button style of the horizon
+  selector — not a native HTML select. Use a custom styled
+  dropdown with the dark theme.
+
+Step 2 — Per-service chart:
+  When service is selected, fetch:
+    GET /forecasts/latest?cloud_provider={cloud}
+      &service={selectedService}&horizon_days={horizon}
+
+  Chart spec: same Recharts ComposedChart as Section A but
+  for a single service. Include the service name in the
+  section header: "{Cloud} — {Service} — {horizon}d Forecast"
+
+  Loading state: show a skeleton placeholder (pulsing amber-tinted
+  rectangle at 40% opacity) while the API call is in flight.
+  This prevents the jarring "No data available" flash.
+
+─────────────────────────────────────────────────────────────────
+Budget Risk Assessment Card (existing — minor fix)
+─────────────────────────────────────────────────────────────────
+
+The card already works correctly (confirmed from screenshot —
+Breach Likely showing for Azure at $19,169 vs $21,000 budget).
+
+Two small fixes:
+1. The monthly budget input should default to a sensible value
+   per cloud: AWS=$180,000 / Azure=$160,000 / GCP=$140,000
+   (these match the synthetic generator's MONTHLY_BUDGET_USD
+   constants). Change when selectedCloud changes.
+2. Add a "Days to Breach" field below Budget Threshold if
+   breach_risk is not "none" and breach_date is not null:
+     "Projected breach in {days_to_breach} days
+      ({breach_date formatted as MMM DD, YYYY})"
+   Style it in amber text.
+
+══════════════════════════════════════════════════════════════════
+PART 4 — INTEGRATION TESTS
+══════════════════════════════════════════════════════════════════
+
+New file: tests/test_integration.py
+(in the root tests/ directory, not inside any module's tests/)
+
+This is the ONLY new file in Part 4.
+All other module test files remain UNTOUCHED.
+
+─────────────────────────────────────────────────────────────────
+Test Suite: End-to-End Pipeline Validation
+─────────────────────────────────────────────────────────────────
+
+Use pytest. All tests require live TimescaleDB at 127.0.0.1:5433.
+Use the FastAPI TestClient for API tests.
+
+IMPORTANT constraints on assertions:
+  - Do NOT assert critical severity > 0 (data-dependent,
+    confirmed absent in current synthetic run)
+  - Do NOT assert exact record counts (varies by run)
+  - DO assert > 0 where data is expected
+  - DO assert schema shape (keys present, types correct)
+
+── Test Group 1: Data Completeness ──────────────────────────────
+
+test_all_clouds_have_billing_records:
+  Query: SELECT cloud_provider, COUNT(*) FROM billing_records
+         GROUP BY cloud_provider
+  Assert: rows for "aws", "azure", "gcp" all present
+  Assert: each cloud has COUNT > 10,000
+
+test_all_clouds_have_spend_features:
+  Query: SELECT DISTINCT cloud_provider FROM spend_features
+  Assert: "aws", "azure", "gcp" all present
+
+test_full_date_range_coverage:
+  Query: SELECT MIN(usage_date), MAX(usage_date)
+         FROM billing_records
+  Assert: min_date <= date(2023, 1, 1)
+  Assert: max_date >= date(2024, 12, 1)
+
+test_all_clouds_have_anomalies:
+  Query: SELECT cloud_provider, COUNT(*) FROM anomalies
+         GROUP BY cloud_provider
+  Assert: "aws", "azure", "gcp" all have COUNT > 0
+
+test_all_clouds_have_forecasts:
+  Query: SELECT DISTINCT cloud_provider FROM forecasts
+  Assert: "aws", "azure", "gcp" all present
+
+test_all_clouds_have_attributions:
+  Query: SELECT DISTINCT cloud_provider FROM cost_attributions
+  Assert: "aws", "azure", "gcp" all present
+
+── Test Group 2: Schema Contract Validation ─────────────────────
+
+test_billing_record_schema:
+  Fetch one row from billing_records.
+  Assert all required columns present:
+    record_id, cloud_provider, account_id, service, usage_date,
+    cost_usd, is_anomaly, tags
+  Assert tags is a string (not dict — preserved from ingestion)
+  Assert cost_usd is float
+
+test_anomaly_schema:
+  Fetch one row from anomalies.
+  Assert: anomaly_id, detection_method, severity,
+          expected_cost, actual_cost, deviation_pct all present
+  Assert: severity in ["low", "medium", "high", "critical"]
+  Assert: detection_method == "ensemble"
+
+test_forecast_schema:
+  Fetch one row from forecasts.
+  Assert: forecast_id, cloud_provider, service, horizon_days,
+          forecast_date, predicted_cost, lower_bound, upper_bound
+  Assert: lower_bound <= predicted_cost <= upper_bound
+  Assert: horizon_days in [7, 14, 30, 90]
+
+test_attribution_schema:
+  Fetch one row from cost_attributions.
+  Assert: shap_values is a dict (deserialized from JSONB)
+  Assert: top_driver_1 is not None
+  Assert: computed_at is present (DB-managed, should always exist)
+
+── Test Group 3: API Contract Tests ─────────────────────────────
+
+test_health_endpoint:
+  GET /health
+  Assert: status == "ok"
+  Assert: db_connected == True
+
+test_billing_bounds_endpoint:
+  GET /billing/bounds
+  Assert: "min_date" and "max_date" in response
+  Assert: min_date <= "2023-12-31"
+  Assert: max_date >= "2024-01-01"
+
+test_billing_by_cloud_all_three:
+  GET /billing/by-cloud?start_date=2023-01-01&end_date=2024-12-31
+  Assert: exactly 3 items in response
+  Assert: {item["dimension"] for item in data} == {"aws","azure","gcp"}
+  Assert: sum of pct_of_total is within 0.5 of 100.0
+
+test_anomalies_azure_not_empty:
+  GET /anomalies?start_date=2023-01-01&end_date=2024-12-31
+    &cloud_provider=azure
+  Assert: total > 0
+  Assert: all items have cloud_provider == "azure"
+
+test_anomalies_gcp_not_empty:
+  Same as above but cloud_provider=gcp
+
+test_anomaly_detail_by_anomaly_id:
+  Fetch one anomaly_id from anomalies table.
+  GET /anomalies/{anomaly_id}
+  Assert: HTTP 200
+  Assert: response["anomaly_id"] == anomaly_id
+  # Confirms anomaly_id (not record_id) is the correct lookup key
+
+test_forecasts_aggregated:
+  GET /forecasts?cloud_provider=aws&horizon_days=30
+    &model_used=ensemble&page_size=500
+  Assert: total > 0
+  Assert: all items have horizon_days == 30
+  Assert: all items have model_used == "ensemble"
+  # This is the call used by the aggregated forecast chart
+
+test_forecasts_latest_per_service:
+  # Get a real service name from the DB first
+  SELECT DISTINCT service FROM forecasts
+    WHERE cloud_provider = 'aws' LIMIT 1
+  service_name = result[0]
+  GET /forecasts/latest?cloud_provider=aws
+    &service={service_name}&horizon_days=30
+  Assert: all items share the same generated_at
+  Assert: items ordered by forecast_date ASC
+  Assert: lower_bound <= predicted_cost on all items
+
+test_budget_risk_all_clouds_fallback:
+  GET /forecasts/budget-risk?monthly_budget_usd=999999999
+  # No cloud_provider filter — tests the all-clouds fallback
+  # fixed in Module 11
+  Assert: HTTP 200
+  Assert: breach_risk == "none"
+    (budget so high it can never be breached)
+
+test_attribution_top_drivers:
+  GET /attribution/top-drivers
+    ?start_date=2023-01-01&end_date=2024-12-31
+  Assert: len(data) > 0
+  Assert: data[0]["driver"] is not None
+  Assert: data[0]["avg_shap_value"] is a float
+  # Top driver should be a lag/rolling feature
+  top_driver = data[0]["driver"]
+  Assert: any(x in top_driver for x in
+    ["lag", "rolling", "mean", "std", "pct_change"])
+
+test_alerts_all_clouds:
+  GET /alerts/summary
+  Assert: "aws" in by_cloud and by_cloud["aws"] > 0
+  Assert: "azure" in by_cloud and by_cloud["azure"] > 0
+  Assert: "gcp" in by_cloud and by_cloud["gcp"] > 0
+
+── Test Group 4: Cross-Module Integrity ─────────────────────────
+
+test_anomaly_flags_consistent:
+  Count is_anomaly=True in billing_records.
+  Count rows in anomalies table.
+  Assert: billing_records anomaly count > 0
+  Assert: anomalies table count > 0
+  # They won't be equal (dimension-based flagging) but both
+  # must be non-zero, confirming the flag propagation worked.
+
+test_feature_date_range_covers_billing:
+  min_billing = SELECT MIN(usage_date) FROM billing_records
+  max_billing = SELECT MAX(usage_date) FROM billing_records
+  min_feature = SELECT MIN(feature_date) FROM spend_features
+  max_feature = SELECT MAX(feature_date) FROM spend_features
+  Assert: min_feature <= min_billing + 30 days
+    (first 30 days have no rolling features — acceptable gap)
+  Assert: max_feature >= max_billing - 7 days
+    (features should cover almost all of billing range)
+
+test_forecast_dates_are_future_relative_to_training:
+  # Forecasts should predict dates AFTER the training data ends
+  max_billing = SELECT MAX(usage_date) FROM billing_records
+    WHERE cloud_provider = 'aws'
+  min_forecast = SELECT MIN(forecast_date) FROM forecasts
+    WHERE cloud_provider = 'aws'
+  Assert: min_forecast > max_billing - 90 days
+    (forecasts should start near the end of the training window)
+
+══════════════════════════════════════════════════════════════════
+PART 5 — DOCKER COMPOSE WIRING
+══════════════════════════════════════════════════════════════════
+
+Update docker-compose.yml (originally scaffolded in Module 1)
+to reflect the actual service configuration confirmed across
+all modules.
+
+─────────────────────────────────────────────────────────────────
+docker-compose.yml — final wiring
+─────────────────────────────────────────────────────────────────
+
+services:
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    environment:
+      POSTGRES_DB: finops
+      POSTGRES_USER: finops_user
+      POSTGRES_PASSWORD: finops_pass
+    ports:
+      - "5433:5432"           # external 5433 → internal 5432
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finops_user -d finops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy   # wait for DB ready, not just started
+    environment:
+      DB_HOST: timescaledb           # Docker service name, not localhost
+      DB_PORT: 5432                  # internal port inside Docker network
+      DB_NAME: finops
+      DB_USER: finops_user
+      DB_PASSWORD: finops_pass
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    volumes:
+      - ./synthetic_data:/app/synthetic_data:ro
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    environment:
+      VITE_API_URL: http://api:8000   # resolves inside Docker network
+    command: npm run dev -- --host 0.0.0.0 --port 3000
+
+volumes:
+  timescale_data:
+
+─────────────────────────────────────────────────────────────────
+Frontend API URL environment awareness
+─────────────────────────────────────────────────────────────────
+
+In frontend/src/, the API base URL must be configurable:
+
+  // frontend/src/api/client.js (or wherever axios/fetch is configured)
+  const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+This means:
+  - Local dev (npm run dev): hits localhost:8000 directly
+  - Docker Compose: hits http://api:8000 via Docker network
+  - No hardcoded localhost strings anywhere in frontend API calls
+
+══════════════════════════════════════════════════════════════════
+VALIDATION CHECKLIST
+══════════════════════════════════════════════════════════════════
+
+PART 1 — DATA:
+[ ] billing_records has rows for aws, azure, gcp covering 2023+2024
+[ ] spend_features has rows for all three clouds
+[ ] anomalies table has rows for all three clouds
+[ ] forecasts table has rows for all three clouds
+[ ] cost_attributions has rows for all three clouds
+[ ] alerts table has rows for all three clouds
+
+PART 2 — FRONTEND FIXES:
+[ ] GET /billing/bounds endpoint added and returns min/max dates
+[ ] DataBoundsContext created and wraps App
+[ ] All pages default date range = last 12 months of real data
+[ ] Date picker max = maxDate from DB (not today)
+[ ] Azure anomalies show data after backfill
+[ ] GCP anomalies show data after backfill
+[ ] Cloud filter change triggers data re-fetch on all pages
+
+PART 3 — FORECAST PAGE:
+[ ] Section A: aggregated chart renders with amber line +
+    confidence band shading for all clouds
+[ ] Section A: empty state message (not generic "No data") shown
+    when no forecast data exists for a selection
+[ ] Section B: service dropdown populated from /billing/by-service
+[ ] Section B: chart renders for selected service
+[ ] Section B: skeleton loading state shown during API call
+[ ] Budget Risk: default budget updates when cloud changes
+[ ] Budget Risk: "Days to Breach" field shown when breach_risk != "none"
+
+PART 4 — TESTS:
+[ ] tests/test_integration.py present
+[ ] All 3 test groups passing (Data Completeness, Schema Contract,
+    API Contract, Cross-Module Integrity)
+[ ] test_all_clouds_have_anomalies passes (azure + gcp non-zero)
+[ ] test_budget_risk_all_clouds_fallback passes (no cloud filter)
+[ ] test_anomaly_detail_by_anomaly_id passes (confirms anomaly_id
+    not record_id is the correct lookup key)
+
+PART 5 — DOCKER:
+[ ] docker-compose.yml updated with healthcheck on timescaledb
+[ ] api service uses DB_HOST=timescaledb (not localhost)
+[ ] frontend uses VITE_API_URL env var (not hardcoded localhost)
+[ ] make dev runs docker-compose up --build successfully
+[ ] GET http://localhost:8000/health returns db_connected: true
+    from within the Docker network
+
+══════════════════════════════════════════════════════════════════
+DO NOT IMPLEMENT
+══════════════════════════════════════════════════════════════════
+- No new ML models or detection logic
+- No new API endpoints beyond GET /billing/bounds
+- No authentication or JWT
+- No new alerting rules
+- No modifications to any shared schema
+- Do not re-run the synthetic data generator
+- Do not modify anything in synthetic_data/
+
+══════════════════════════════════════════════════════════════════
+REPORT BACK AFTER RUNNING
+══════════════════════════════════════════════════════════════════
+1. DB verification — row counts per cloud for billing_records,
+   anomalies, and forecasts after backfill
+2. Forecast chart — does Section A (aggregated) render with data
+   for all three clouds? Screenshot if possible.
+3. Service dropdown — which services appear for each cloud?
+4. Date range — does the picker now default to 2024-01-01 to
+   2024-12-31 (or the actual data bounds)?
+5. Integration test results — pass/fail count for all 4 groups
+6. Docker Compose — does make dev bring up the full stack?
+   Does GET http://localhost:8000/health return db_connected: true?
+7. Any deviations from the backfill pipeline (skipped groups,
+   insufficient rows for LSTM/forecasting on azure/gcp)
+8. Any frontend rendering issues remaining after the fixes
+
+══════════════════════════════════════════════════════════════════

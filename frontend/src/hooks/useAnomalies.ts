@@ -13,7 +13,7 @@ export const useAnomalies = (severity?: string) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
-  const fetchAnomalies = useCallback(async (page = 1) => {
+  const fetchAnomalies = useCallback(async (page = 1, pageSize = 25) => {
     setLoading(true);
     setError(null);
     try {
@@ -23,7 +23,7 @@ export const useAnomalies = (severity?: string) => {
         ...(cloud !== 'all' ? { cloud_provider: cloud } : {}),
         ...(severity && severity !== 'all' ? { severity } : {}),
         page,
-        page_size: 20
+        page_size: pageSize
       };
       const data = await getAnomalies(params);
       setAnomalies(data);

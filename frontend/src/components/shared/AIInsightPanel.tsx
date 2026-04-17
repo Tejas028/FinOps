@@ -21,12 +21,19 @@ export const AIInsightPanel: React.FC<AIInsightPanelProps> = ({
 
   useEffect(() => {
     const fetchInsight = async () => {
-      if (!payload) return;
+      if (!payload) {
+        setInsight(null);
+        setError(false);
+        return;
+      }
       
       setLoading(true);
       setError(false);
+      setInsight(null); // Clear previous insight while loading new one
+      
       try {
-        const response = await axios.post(`http://localhost:8000${endpoint}`, payload);
+        const baseUrl = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+        const response = await axios.post(`${baseUrl}${endpoint}`, payload);
         setInsight(response.data.insight);
       } catch (err) {
         console.error('AI Insight fetch failed:', err);
@@ -37,7 +44,7 @@ export const AIInsightPanel: React.FC<AIInsightPanelProps> = ({
     };
 
     fetchInsight();
-  }, [trigger, endpoint]);
+  }, [trigger, endpoint, payload]);
 
   if (!payload && !loading) return null;
 

@@ -1,0 +1,73 @@
+version: "3.9"
+
+services:
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: finops_db_prod
+    environment:
+      POSTGRES_DB:       ${TIMESCALE_DB}
+      POSTGRES_USER:     ${TIMESCALE_USER}
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD}
+    volumes:
+      - timescale_prod_data:/var/lib/postgresql/data
+      - ./storage/init_db/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./features/init_db/features_schema.sql:/docker-entrypoint-initdb.d/02_features.sql
+      - ./detection/init_db/detection_schema.sql:/docker-entrypoint-initdb.d/03_detection.sql
+      - ./forecasting/init_db/forecasts_schema.sql:/docker-entrypoint-initdb.d/04_forecasts.sql
+      - ./attribution/init_db/attribution_schema.sql:/docker-entrypoint-initdb.d/05_attribution.sql
+      - ./alerting/init_db/alerts_schema.sql:/docker-entrypoint-initdb.d/06_alerts.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TIMESCALE_USER} -d ${TIMESCALE_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - finops_net
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: finops_api_prod
+    environment:
+      TIMESCALE_HOST:     timescaledb
+      TIMESCALE_PORT:     5432
+      TIMESCALE_DB:       ${TIMESCALE_DB}
+      TIMESCALE_USER:     ${TIMESCALE_USER}
+      TIMESCALE_PASSWORD: ${TIMESCALE_PASSWORD}
+      GROQ_API_KEY:       ${GROQ_API_KEY}
+      GROQ_MODEL:         ${GROQ_MODEL}
+      API_HOST:           0.0.0.0
+      API_PORT:           8000
+      LOG_LEVEL:          ${LOG_LEVEL:-INFO}
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - finops_net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: finops_frontend_prod
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    networks:
+      - finops_net
+    restart: unless-stopped
+
+networks:
+  finops_net:
+    driver: bridge
+
+volumes:
+  timescale_prod_data:

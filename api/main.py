@@ -19,9 +19,13 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+import os
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,14 +34,16 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}")
-    # Return a 200 with empty data structure to keep UI alive but showing 'No Data'
-    # instead of a broken 500 state
+    
+    # Check if request origin is allowed
+    origin = request.headers.get("origin")
+    allow_origin = origin if origin in ALLOWED_ORIGINS else ALLOWED_ORIGINS[0]
+
     response = JSONResponse(
         status_code=200,
         content={"data": [], "total": 0, "page": 1, "page_size": 20, "has_next": False, "error": str(exc)}
     )
-    # Ensure CORS headers are included even on exception responses
-    response.headers["Access-Control-Allow-Origin"] = "http://localhost:3000"
+    response.headers["Access-Control-Allow-Origin"] = allow_origin
     response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
