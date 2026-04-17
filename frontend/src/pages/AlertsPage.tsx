@@ -6,7 +6,7 @@ import { ExportButton } from '../components/shared/ExportButton';
 import { exportToCsv } from '../utils/exportCsv';
 import { getAlerts, getAlertsSummary, resolveAlert } from '../api/alerts';
 import type { AlertListItem, AlertSummary, PaginatedResponse } from '../types';
-import { Bell, CheckCircle, ChevronRight, ChevronDown } from 'lucide-react';
+import { CheckCircle, ChevronRight, ChevronDown } from 'lucide-react';
 
 const selectStyle: React.CSSProperties = {
   background: 'var(--bg-surface)',

@@ -16,7 +16,6 @@ export const AttributionPage: React.FC = () => {
   const [selectedCloud, setSelectedCloud] = useState<string>(globalCloud === 'all' ? 'aws' : globalCloud);
   const [selectedService, setSelectedService] = useState<string>('');
   const [services, setServices] = useState<string[]>([]);
-  const [loadingServices, setLoadingServices] = useState(false);
 
   const { topDrivers, attributionData, loadingTopDrivers, loadingAttribution } = useAttribution(
     selectedCloud, 
@@ -27,7 +26,6 @@ export const AttributionPage: React.FC = () => {
   useEffect(() => {
     let active = true;
     const fetchSvc = async () => {
-      setLoadingServices(true);
       try {
         const data = await getAttributionServices();
         if (active) {
@@ -38,8 +36,6 @@ export const AttributionPage: React.FC = () => {
         }
       } catch (e) {
         console.error("Failed to fetch attribution services", e);
-      } finally {
-        if (active) setLoadingServices(false);
       }
     };
     fetchSvc();

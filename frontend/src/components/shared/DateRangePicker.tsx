@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useFilterContext } from '../../context/FilterContext';
 import { useDataBounds } from '../../context/DataBoundsContext';
 import { subDays } from 'date-fns';

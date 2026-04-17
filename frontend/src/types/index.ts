@@ -64,6 +64,7 @@ export interface ForecastItem {
 export interface BudgetRisk {
   breach_risk: "none" | "possible" | "likely" | "certain";
   breach_date: string | null;
+  days_to_breach: number | null;
   projected_monthly_cost: number;
   monthly_budget_usd: number;
   confidence_pct: number;
